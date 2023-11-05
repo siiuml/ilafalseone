@@ -1,0 +1,9 @@
+# Compiled
+__pycache__/
+
+# Spyder
+.spyproject/
+
+# Log
+old/
+test/
