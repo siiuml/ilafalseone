@@ -720,11 +720,9 @@ class SortedSet[T](list[T], _MutableSet[T], Sorted[T]):
         i = 0
         for obj in (other := iter(self._get_material(other))):
             if (i := self.bisect(obj, i)) >= len(self):
-                # print(i, obj)
                 self.append(obj)
                 self += other
                 break
-            # print(i, obj)
             if self[i] == obj:
                 del self[i]
             else:
@@ -1079,7 +1077,7 @@ class WrappedMapping[KT, VT, WKT, WVT](_MutableMapping[KT, VT]):
         return len(self.data)
 
     def __getitem__(self, key: KT, /) -> VT:
-        return self.value.extract(self.data[self.key(key)])
+        return self.value.expand(self.data[self.key(key)])
 
     def __setitem__(self, key: KT, value: VT) -> VT:
         self.data[self.key(key)] = self.value(value)
@@ -1094,7 +1092,7 @@ class WrappedMapping[KT, VT, WKT, WVT](_MutableMapping[KT, VT]):
         return self.key(key) in self.data
 
     def get[DT](self, key: KT, default: DT = None, /) -> VT:
-        return self.data.get(self.key(key), default)
+        return self.value.expand(self.data.get(self.key(key), default))
 
     @_recursive_repr()
     def __repr__(self) -> bool:

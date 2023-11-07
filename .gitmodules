@@ -1,0 +1,3 @@
+[submodule "ilfocore"]
+	path = ilfocore
+	url = git@github.com:siiuml/ilfocore.git

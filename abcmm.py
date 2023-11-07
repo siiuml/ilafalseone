@@ -20,7 +20,7 @@ from collections.abc import (
     Sequence,
     Sized
 )
-from hashlib import file_digest, new as get_hasher
+from hashlib import new as get_hasher
 from io import BufferedIOBase, BufferedReader, BytesIO
 from itertools import chain as iter_chain
 from queue import Queue
@@ -40,37 +40,23 @@ from .ilfocore.utils import (
 from .ilfocore.utils.multithread import call_forever, in_queue
 
 from .basemodule import Bounded, DataBased
+from .decreq import Cryptic as _Cryptic
 from .session import Session
 from .session import DynamicSync, Sync, concat_varname, get_servfunc
 from .session import Fillers, SyncFiller
 from .utils import Inner, OrderedSet, SortedDict, SortedSet
 from .restype import (
-    Cryptic as _Cryptic,
     ResType,
     ResTypeManager,
     Resource,
     Serializable,
     TypedMapping,
-    WithMsg as _WithMsg
+    WithMsg
 )
 from .signing import Signer, SigningManager
 
 # IDE
 T = None
-
-
-class WithMsg[T: Serializable](_WithMsg):
-
-    """New WithMsg class."""
-
-    __slots__ = '_msg'
-
-    def __init__(self, msg: T):
-        self._msg = msg
-
-    @property
-    def msg(self) -> T:
-        return self._msg
 
 
 class Cryptic(_Cryptic):
@@ -112,33 +98,32 @@ class Salted[T: Resource](WithMsg[T], Resource, Hashed, Bounded):
 
     """Cryptic resource with salt."""
 
-    __slots__ = '_mod', '_hash', '_alg', '_salt'
+    __slots__ = '_mod', '_id', '_hash', '_alg', '_salt'
 
     def __init__(self, mod: 'ABCMM', id_: int, alg: str | None, *args):
-        Resource.__init__(self, id_)
         self._mod = mod
+        self._id = id_
         self._alg = alg
         if alg is None:
             self._hash, = args
-            self._salt = msg = None
+            self._salt = self._msg = None
         else:
-            self._salt, msg = args
-        super().__init__(msg)
+            self._salt, self._msg = args
 
     class Material(Cryptic.Material):
 
         """Material class of Salted class."""
+
+        def to_fillers(self, fillers: Fillers):
+            salted = self._outer
+            fillers.append(salted.salt)
+            WithMsg.to_fillers(salted, fillers)
 
         def to_bytes(self) -> bytes:
             salted = self._outer
             return pack_with_size(salted.salt) + WithMsg.to_bytes(salted)
 
     __eq__ = Serializable.__eq__
-
-    def to_bytes(self) -> bytes:
-        return get_hasher(
-            self._alg, self._salt + super().to_bytes()
-        ).digest() if self.is_decrypted else self._hash
 
     def to_fillers(self, fillers: Fillers):
         fillers.append(SyncFiller((self._mod, 'alg'), self._alg))
@@ -147,6 +132,11 @@ class Salted[T: Resource](WithMsg[T], Resource, Hashed, Bounded):
         else:
             fillers.append(SyncFiller((self._mod, 'alg'), None))
             Serializable.to_fillers(self, fillers)
+
+    def to_bytes(self) -> bytes:
+        return get_hasher(
+            self._alg, self._salt + super().to_bytes()
+        ).digest() if self.is_decrypted else self._hash
 
     @property
     def algorithm(self) -> str:
@@ -157,6 +147,14 @@ class Salted[T: Resource](WithMsg[T], Resource, Hashed, Bounded):
     def salt(self) -> bytes:
         """Random bytes."""
         return self._salt
+
+    @property
+    def msg(self) -> Resource:
+        return self._msg
+
+    @property
+    def rid(self) -> int:
+        return self._id
 
     @property
     def rtype(self) -> ResType:
@@ -172,16 +170,17 @@ class Owned[T: Resource](WithMsg[T], Resource, Bounded):
 
     """Resource with its owner."""
 
-    __slots__ = '_mod', '_owner'
+    __slots__ = '_mod', '_id', '_owner', '_msg'
 
     def __init__(self, mod: 'ABCMM', id_: int, owner: Signer, msg: Resource):
-        super().__init__(msg)
-        Resource.__init__(self, id_)
         self._mod = mod
+        self._id = id_
         self._owner = owner
+        self._msg = msg
 
     def __eq__(self, other):
-        return (isinstance(other, Owned)
+        return (self is other
+                or isinstance(other, Owned)
                 and self._owner == other._owner
                 and self._msg == other._msg)
 
@@ -198,6 +197,14 @@ class Owned[T: Resource](WithMsg[T], Resource, Bounded):
         return self._owner
 
     @property
+    def msg(self) -> Resource:
+        return self._msg
+
+    @property
+    def rid(self) -> int:
+        return self._id
+
+    @property
     def rtype(self) -> ResType:
         """.owned"""
         return self._mod.type_owned
@@ -211,9 +218,10 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
 
     """MsgBlock class."""
 
-    __slots__ = ('_chain', '_pos', '_hash', '_alg', '_owner', '_salt', '_data',
+    __slots__ = ('_mod', '_id', '_chain', '_pos', '_hash',
+                 '_alg', '_msg',
                  '_prev_ids', '_next_ids', '_sigs', '_signers',
-                 '_mod', '_lock')
+                 '_lock')
 
     def __init__(
         self,
@@ -229,8 +237,8 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
         prev_ids: tuple[int] = None,
         next_ids: OrderedSet[int] = None
     ):
-        Bounded.__init__(self, mod)
-        Resource.__init__(self, mod.type_msgblk, )
+        self._mod = mod
+        self._id = id_
         if isinstance(chain, int):
             chain = mod.get_chain(chain)
             chain.blocks[pos] = self
@@ -423,7 +431,7 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
 
         chain_id, pos, self._hash, alg, *left = next(mod.sql_conn.execute("""
             SELECT hash, alg, salt, owner, type, res FROM soblock WHERE id = ?
-            """, (id_ := self._rid,)))
+            """, (id_ := self._id,)))
         if alg is not None:
             self._alg = alg
             self._msg = mod.from_row(id_, alg, *left)
@@ -480,6 +488,19 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
         return signers
 
     @property
+    def msg(self) -> Resource:
+        return self._msg
+
+    @property
+    def rid(self) -> int:
+        return self._id
+
+    @property
+    def rtype(self) -> ResType:
+        """.msgblk"""
+        return self._mod.type_msgblk
+
+    @property
     def module(self) -> 'ABCMM':
         return self._mod
 
@@ -491,22 +512,18 @@ class BrokenGraph(Resource, Bounded):
 
     """
 
-    __slots__ = '_mod', '_start', '_end', '_breaker'
+    __slots__ = '_mod', '_id', '_start', '_end', '_breaker'
 
     def __init__(self, mod: 'ABCMM', id_: int,
                  start: Iterable[MsgBlock], end: Iterable[MsgBlock],
                  breaker: Serializable | None = None):
-        super().__init__(id_)
-        Bounded.__init__(self, mod)
+        self._mod = mod
+        self._id = id_
         end = set(end)
         start = set(start) - end
         end |= start
         self._start, self._end = start, end
         self._breaker = breaker
-
-    def shall_break(self, blk: MsgBlock):
-        """Return True if iteration breaks here."""
-        return False
 
     def _iter(self, reverse: bool) -> Iterator[MsgBlock]:
         next_lvl = list(self._start)
@@ -549,6 +566,10 @@ class BrokenGraph(Resource, Bounded):
     def breaker(self) -> Resource | None:
         """Where iteration breaks in broken block graph."""
         return self._breaker
+
+    @property
+    def rid(self) -> int:
+        return self._id
 
     @property
     def rtype(self) -> ResType:
@@ -786,7 +807,7 @@ class BidirectedFinder(RangeFinder):
     def __call__(self, chain: Chain, pos: int, check: CheckFunc
                  ) -> tuple[int, int]:
         """Call to get range from a position."""
-        return (find_mono(chain, pos, self._from, 1, check),
+        return (find_mono(chain, pos, self._forward, 1, check),
                 find_mono(chain, pos, self._backward, -1, check))
 
     @property
@@ -827,8 +848,12 @@ class LimitedFinder(RangeFinder):
     def __call__(self, chain: Chain, pos: int, check: CheckFunc
                  ) -> tuple[int, int]:
         """Call to get range from a position."""
-        from_ = find_mono(chain, pos, self._off, -1, check)
-        to = find_mono(chain, from_, self._maxlen, 1, check)
+        maxlen = self._maxlen
+        off = self._off
+        from_ = find_mono(chain, pos, off, -1, check)
+        to = find_mono(chain, pos, maxlen + off, 1, check)
+        if (diff := to - from_ - maxlen) < 0:
+            from_ = find_mono(chain, from_, diff, -1, check)
         return from_, to
 
     @property
@@ -875,6 +900,9 @@ def _deser_alg(buf: BufferedReader) -> str | None:
 
 class SaltedMapping(TypedMapping[Salted], Bounded):
 
+    def __init__(self, mod: 'ABCMM'):
+        self._mod = mod
+
     def __len__(self) -> int:
         conn = self._mod.sql_conn
         not_hidden, = next(conn.execute(
@@ -912,18 +940,23 @@ class SaltedMapping(TypedMapping[Salted], Bounded):
         return self.HashMapping(self)
 
     def read(self, con: Session, buf: BufferedReader) -> Salted:
+        mod = self._mod
         if (alg := read_by_size(buf, not_none=False)) is None:
             hash_ = read_by_size(buf)
-            return Salted(self._mod, None, alg, hash_)
+            return Salted(mod, None, alg, hash_)
         salt = read_by_size(buf)
-        type_ = self._mod.restype_manager.type.mapping.read(con, buf)
+        type_ = mod.restype_manager.type.mapping.read(con, buf)
         msg = type_.mapping.read(con, buf)
-        return Salted(self, None, alg, salt, msg)
+        return Salted(mod, None, alg, salt, msg)
 
     @property
     def rtype(self) -> ResType:
         """.salted"""
         return self._mod.type_salted
+
+    @property
+    def module(self) -> 'ABCMM':
+        return self._mod
 
 
 class OwnedMapping(TypedMapping[Owned], Bounded):
@@ -931,10 +964,7 @@ class OwnedMapping(TypedMapping[Owned], Bounded):
     """Owned resource mapping."""
 
     def __init__(self, mod: 'ABCMM'):
-        super().__init__(mod)
-        self._id_map = None
-        self._bytes_map = None
-        self._sync_map = None
+        self._mod = mod
 
     def __len__(self) -> int:
         cnt, = next(self._mod.sql_conn.execute(
@@ -970,7 +1000,7 @@ class OwnedMapping(TypedMapping[Owned], Bounded):
             type_ = mod.restype_manager.type.mapping.bytes[
                 read_by_size(buf)]
             msg = type_.mapping.bytes[read_by_size(buf)]
-            return Owned(self, None, signer, msg)
+            return Owned(mod, None, signer, msg)
 
     @property
     def bytes(self) -> BytesMapping:
@@ -981,12 +1011,16 @@ class OwnedMapping(TypedMapping[Owned], Bounded):
         signer = mod.signing_manager.type_signer.mapping.read(buf)
         type_ = mod.restype_manager.type.mapping.read(con, buf)
         msg = type_.mapping.read(con, buf)
-        return Owned(self, None, signer, msg)
+        return Owned(mod, None, signer, msg)
 
     @property
     def rtype(self) -> ResType:
         """.owned"""
         return self._mod.type_owned
+
+    @property
+    def module(self) -> 'ABCMM':
+        return self._mod
 
 
 class MsgBlkMapping(TypedMapping[MsgBlock], Bounded):
@@ -994,7 +1028,7 @@ class MsgBlkMapping(TypedMapping[MsgBlock], Bounded):
     """MsgBlock mapping."""
 
     def __init__(self, mod: 'ABCMM'):
-        super().__init__(mod)
+        self._mod = mod
         self._id_map = self.IDMapping(self)
         self._hash_map = self.HashMapping(self)
 
@@ -1126,6 +1160,10 @@ class MsgBlkMapping(TypedMapping[MsgBlock], Bounded):
     def bytes(self) -> HashMapping:
         return self._hash_map
 
+    @property
+    def module(self) -> 'ABCMM':
+        return self._mod
+
 
 in_queue = in_queue('_queue')
 
@@ -1179,7 +1217,7 @@ class ABCMM(DataBased):
         self._type_owned = type_ = rtyper.type.mapping.str['.owned']
         type_.mapping = OwnedMapping(self)
         with conn:
-            conn.executescript("""                
+            conn.executescript("""
                 CREATE TABLE IF NOT EXISTS soblock(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chain INTEGER NOT NULL,

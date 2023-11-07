@@ -92,7 +92,8 @@ class Serializable(_IOSerializable, Syncable):
 
     def __eq__(self, other) -> bool:
         return (self is other
-                or self.rtype == other.rtype
+                or isinstance(other, Serializable)
+                and self.rtype == other.rtype
                 and self.to_bytes() == other.to_bytes())
 
     def __hash__(self) -> int:
@@ -126,28 +127,11 @@ class WithMsg[T: Serializable](Serializable):
         """Inner serializable message."""
 
 
-class Cryptic(Serializable):
-
-    """Cryptic class."""
-
-    __slots__ = ()
-
-    @property
-    @abstractmethod
-    def material(self) -> Serializable | None:
-        """Material."""
-
-    def is_decrypted(self) -> bool:
-        """If self is decrypted."""
-        return self.material is not None
-
-
 class Resource(Serializable):
 
     """Resource class."""
 
-    def __init__(self, id_: int):
-        self._rid = id_
+    __slots__ = ()
 
     def __eq__(self, other) -> bool:
         return (self is other
@@ -160,9 +144,9 @@ class Resource(Serializable):
         return f"<{self.__class__.__name__} id={self._rid}>"
 
     @property
+    @abstractmethod
     def rid(self) -> int:
         """Resource ID."""
-        return self._rid
 
 
 class TypedMapping[T: Serializable](ABC):
@@ -199,7 +183,7 @@ class ResType(Resource, Bounded):
 
     """Resource type class."""
 
-    __slots__ = '_mod', '__data', '_mapping'
+    __slots__ = '_mod', '_id', '__data', '_mapping'
 
     def __init__(self, mod: 'ResTypeManager', id_: int, type_str: str):
         self._mod = mod
@@ -239,6 +223,10 @@ class ResType(Resource, Bounded):
         return self._mod.type
 
     @property
+    def rid(self) -> int:
+        return self._id
+
+    @property
     def module(self) -> 'ResTypeManager':
         return self._mod
 
@@ -246,6 +234,8 @@ class ResType(Resource, Bounded):
 class RTypeMapping(TypedMapping[ResType], Bounded):
 
     """Type mapping."""
+
+    __slots__ = '_mod', '_id_map', '_str_map'
 
     def __init__(self, mod: 'ResTypeManager'):
         self._mod = mod
@@ -306,10 +296,10 @@ class ResTypeManager(DataBased):
         type_.mapping = RTypeMapping(self)
         self._lock = RLock()
 
-    def load_data(self, database: str):
+    def load_data(self, conn):
         """Load data from database."""
-        super().__init__(database, check_same_thread=False)
-        with self._sql_conn as conn:
+        super().load_data(conn)
+        with conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS res_type(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

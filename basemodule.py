@@ -49,7 +49,7 @@ class Module(ABC):
         """
 
     def setup_session(self, con: Session):
-        """Called by ilafalseone.session.Session.setup_common(con).
+        """Called by session.Session.setup_common(con).
 
         May be overriden.
 
@@ -106,37 +106,9 @@ class Module(ABC):
         """
         self.stop()
 
-    def send_packages_to(
-        self,
-        packages: Iterable[bytes],
-        target: Session | int,
-        check_ack=False
-    ) -> int | dict[Session, int]:
-        """Send a list of module packages.
-
-        Return the sequence number of the last module
-        packet sent, or the sequence numbers of the last
-        module packets sent in different sessions.
-
-        """
-        if isinstance(target, Session):
-            seq = target.send_packages(packages)
-            if check_ack:
-                target.seqs_to_ack.append((seq, self))
-            return seq
-
-        if isinstance(target, Key):
-            seqs = self._account.node.send_packages_to(packages, target)
-            if check_ack:
-                for con, seq in seqs.items():
-                    con.seqs_to_ack.append((seq, self))
-            return seqs
-
-        raise TypeError
-
-    def sendto(self, package: bytes, target: Session | Key
+    def sendto(self, data: bytes | Iterable[bytes], target: Session | Key
                ) -> int | dict[Session, int]:
-        """Send a module package.
+        """Send a module package or a list of module packages.
 
         Return the sequence number of the last module
         packet sent, or the sequence numbers of the last
@@ -144,12 +116,12 @@ class Module(ABC):
 
         """
         if isinstance(target, Session):
-            seq = target.send(package)
+            seq = target.send(data)
             target.seqs_to_ack.append((seq, self))
             return seq
 
         if isinstance(target, Key):
-            seqs = self._account.node.sendto(package, target)
+            seqs = self._account.node.sendto(data, target)
             for con, seq in seqs.items():
                 con.seqs_to_ack.append((seq, self))
             return seqs

@@ -78,7 +78,7 @@ class Account:
             name=f"Serving thread on port {self._node.server_address[1]}",
             daemon=True
         )
-        # self._node.thread.start()
+        self._node.thread.start()
         for mod in self._mods.values():
             mod.connect()
         logging.debug("login successful")

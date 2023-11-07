@@ -17,8 +17,6 @@ from collections.abc import Callable, Hashable, MutableSequence
 from io import BufferedIOBase, BufferedReader, BytesIO
 from typing import TYPE_CHECKING, Any, Union
 
-from .utils import OrderedList
-
 from .ilfocore.constants import ENCODING
 from .ilfocore.ilfonode import BaseSession
 from .ilfocore.utils import (
@@ -27,6 +25,8 @@ from .ilfocore.utils import (
     write_integral,
     write_with_size
 )
+
+from .utils import OrderedList
 
 if TYPE_CHECKING:
     from .basemodule import Module
