@@ -32,8 +32,6 @@ if TYPE_CHECKING:
     from .basemodule import Module
 
 
-# IDE
-T = None
 type Serialization[T] = Callable[[T, BufferedIOBase], int]
 type Deserialization[T] = Callable[[BufferedIOBase], T | None]
 

@@ -23,17 +23,24 @@ from .ilfocore.lib.signature import (
     get_sign,
     get_verify
 )
-from .ilfocore.utils import read_by_size, write_with_size
+from .ilfocore.utils import (
+    NULL,
+    pack_with_size,
+    read_by_size,
+    write_with_size
+)
 
 from .basemodule import Bounded, DataBased
 from .session import Session
 from .session import Sync, concat_varname, get_servfunc
 from .session import Fillers, SyncFiller
-from .utils import Inner
-from .restype import ResType, ResTypeManager, Resource, TypedMapping, WithMsg
 
-# IDE
-T = None
+from .decreq import InnerRes
+from .restype import ResType, ResTypeManager, Resource, TypedMapping, WithMsg
+from .restype import encode
+
+from .utils import Inner
+from .utils import FuncWrapper, Wrapper, WrappedMapping
 
 
 class Signer(Resource, Bounded):
@@ -48,16 +55,6 @@ class Signer(Resource, Bounded):
             raise ValueError(priv_key)
         self._pub = pub_key
         self._priv = priv_key
-
-    def to_fillers(self, fillers: Fillers):
-        fillers.append(SyncFiller((self._mod, 'signer'), self))
-
-    def to_bytes(self) -> bytes:
-        """Public key in bytes."""
-        return self._pub.to_bytes()
-
-    def __repr__(self) -> str:
-        return f"<Signer {self._id}: {self}>"
 
     @property
     def public(self) -> PublicKey:
@@ -86,6 +83,19 @@ class Signer(Resource, Bounded):
                 "UPDATE signer SET priv_key = ? WHERE id = ?",
                 (priv.to_bytes(), id_))
 
+    def __repr__(self) -> str:
+        return f"<Signer {self._id}: {self}>"
+
+    def to_fillers(self, fillers: Fillers):
+        fillers.append(SyncFiller((self._mod, 'signer'), self))
+
+    def to_bytes(self) -> bytes:
+        return pack_with_size(encode(self._pub.name)) + self._pub.to_bytes()
+
+    @property
+    def rdig(self) -> bytes:
+        return self._pub.to_bytes()
+
     @property
     def rtype(self) -> ResType:
         """.signer"""
@@ -103,7 +113,11 @@ class SignerMapping(TypedMapping[Signer], Bounded):
 
     """Signer mapping."""
 
-    class KeyMapping(dict[bytes, Signer], Inner['SignerMapping']):
+    noalgwrap = FuncWrapper[bytes, [str | None, bytes]](
+        lambda key: (None, key), lambda pair: pair[1], "noalgwrap")
+
+    class KeyMapping(Mapping[KeyLike, Signer],
+                     dict[bytes, Signer], Inner['SignerMapping']):
 
         def __init__(self, outer: 'SignerMapping'):
             super().__init__()
@@ -124,7 +138,8 @@ class SignerMapping(TypedMapping[Signer], Bounded):
             if pub_key is not None or isinstance(key, Iterable):
                 alg, key = key
             else:
-                alg = None
+                buf = BytesIO(key)
+                alg, key = read_by_size(buf, not_none=False), buf.read()
             if alg is not None:
                 if (signer := super().get(key)) is not None:
                     return signer
@@ -138,7 +153,6 @@ class SignerMapping(TypedMapping[Signer], Bounded):
     def __init__(self, mod: 'SigningManager'):
         self._mod = mod
         self._id_map = {}
-        self._key_map = self.KeyMapping(self)
 
     def _add_key(self, pub_key: PublicKey) -> Signer:
         mod = self._mod
@@ -159,9 +173,13 @@ class SignerMapping(TypedMapping[Signer], Bounded):
     @property
     def key(self) -> KeyMapping:
         """Key-signer mapping."""
-        return self._key_map
+        return self.KeyMapping(self)
 
     bytes = key
+
+    @property
+    def rdig(self) -> Mapping[bytes, ResType, KeyLike, ResType]:
+        return WrappedMapping(self.key, self.noalgwrap)
 
     def read(self, con: Session, buf: BufferedReader) -> Signer:
         return con.syncs[self._mod, 'signer'].read(buf)
@@ -180,14 +198,14 @@ class Signature[T: Resource](WithMsg[T], Resource, Bounded):
 
     """Signature class."""
 
-    __slots__ = '_mod', '_id', '_sig', '_owner', '_msg'
+    __slots__ = '_mod', '_id', '_sig', '_signer', '_msg'
 
-    def __init__(self, mod: 'SigningManager', id_: int, sig: bytes,
-                 owner: Signer, msg: Resource):
+    def __init__(self, mod: 'SigningManager', id_: int,
+                 sig: bytes, signer: Signer, msg: Resource):
         self._mod = mod
         self._id = id_
         self._sig = sig
-        self._owner = owner
+        self._signer = signer
         self._msg = msg
 
     @classmethod
@@ -200,21 +218,44 @@ class Signature[T: Resource](WithMsg[T], Resource, Bounded):
         res = res_type.mapping.rid[res_id]
         return cls(mod, id_, sig, signer, res)
 
+    class Material(InnerRes['Signature']):
+
+        """Material class."""
+
+        def to_fillers(self, fillers: Fillers):
+            outer = self._outer
+            fillers.append(outer.rdig)
+            fillers.append(SyncFiller(
+                ('SigningManager', 'signer'), signer := outer.signer))
+            if signer is not None:
+                WithMsg.to_fillers(outer)
+
+        def to_bytes(self) -> bytes:
+            outer = self._outer
+            if (signer := outer.signer) is None:
+                return outer.to_bytes()
+            return (pack_with_size(outer.rdig)
+                    + pack_with_size(signer.to_bytes())
+                    + WithMsg.to_bytes(outer))
+
     def to_bytes(self) -> bytes:
-        """Public key in bytes."""
-        return self._sig
+        return self._sig + NULL
 
     @recursive_repr()
     def __repr__(self) -> str:
-        return f"<Signature to {self._res!r} by {self._signer!r}>"
+        return f"<Signature to {self._msg!r} by {self._signer!r}>"
 
     @property
-    def owner(self) -> Signer:
-        return self._owner
+    def signer(self) -> Signer:
+        return self._signer
 
     @property
     def rid(self) -> int:
         return self._id
+
+    @property
+    def rdig(self) -> bytes:
+        return self._sig
 
     @property
     def rtype(self) -> ResType:
@@ -226,6 +267,9 @@ class Signature[T: Resource](WithMsg[T], Resource, Bounded):
         return self._mod
 
 
+type SigParams = tuple[bytes, Signer, Resource]
+
+
 class SignatureMapping(TypedMapping[Signer], Bounded):
 
     """Signature mapping."""
@@ -235,6 +279,11 @@ class SignatureMapping(TypedMapping[Signer], Bounded):
         def __len__(self) -> int:
             return len(self._outer)
 
+        def __iter__(self):
+            for id_, in self._outer.module.sql_conn.execute(
+                    "SELECT id FROM signature"):
+                yield id_
+
         def __getitem__(self, key: int) -> Signature:
             mod = self._outer.module
             row = mod.sql_conn.execute(
@@ -243,60 +292,62 @@ class SignatureMapping(TypedMapping[Signer], Bounded):
                 raise KeyError(key)
             return Signature.from_row(mod, *row)
 
-    class SigMapping(Mapping[bytes, Signature], Inner['SignatureMapping']):
+    class SigMapping(Mapping[SigParams, Signature], Inner['SignatureMapping']):
 
         def __len__(self) -> int:
             return len(self._outer)
 
-        def __getitem__(self, key: bytes) -> Signature:
+        def __iter__(self) -> Iterable[SigParams]:
+            mod = self._outer.module
+            signer_id_map = mod.type_signer.mapping.rid
+            type_id_map = mod.restype_manager.type.mapping.rid
+            for sig_bytes, signer_id, type_id, msg_id in mod.sql_conn.execute(
+                    "SELECT sig, signer, mtype, msg FROM signature"):
+                signer = signer_id_map[signer_id]
+                msg = type_id_map[type_id].mapping.rid[msg_id]
+                yield sig_bytes, signer, msg
+
+        def get(self, key: SigParams, default=None) -> Signature:
+            sig_bytes, signer, msg = key
             mod = self._outer.module
             row = mod.sql_conn.execute(
+                "SELECT * FROM signature WHERE signer = ?, mtype = ?, msg = ?",
+                (signer.rid, msg.rtype.rid, msg.rid)
+            ) if sig_bytes is None else mod.sql_conn.execute(
                 "SELECT * FROM signature WHERE sig = ?", (key,))
-            if row is None:
-                raise KeyError(key)
-            return Signature.from_row(mod, *row)
-
-    class OwnedMsgMapping(
-            Mapping[Resource, Signature], Inner['SignatureMapping']):
-
-        def __len__(self) -> int:
-            return len(self._outer)
-
-        def get(self, key: tuple[Signer, Resource], default=None) -> Signature:
-            signer, res = key
-            mod = self._outer.module
-            row = mod.sql_conn.execute(
-                "SELECT * FROM signature WHERE signer = ?, type = ?, res = ?",
-                (signer.rid, res.rtype.rid, res.rid))
             if row is None:
                 return default
             return Signature.from_row(mod, *row)
 
-        def __getitem__(self, key: tuple[Signer, Resource]) -> Signature:
+        def __getitem__(self, key: SigParams) -> Signature:
+            sig_bytes, signer, msg = key
+            mod = self._outer.module
             if (sig := self.get(key)) is not None:
+                if sig.is_decrypted or signer is None or msg is None:
+                    return sig
+                signer.public.verify(sig_bytes, WithMsg.rdig.fget(msg))
+                sig._signer = signer
+                sig._msg = msg
                 return sig
-
-            signer, res = key
-            if (priv_key := signer.private) is None:
-                raise KeyError(key)
-            sig_bytes = priv_key.sign(res.to_bytes())
-            return self._outer.add_sig(sig_bytes, signer, res)
+            if sig_bytes is None:
+                if (priv_key := signer.private) is None:
+                    raise ValueError(f"Private key is absent: {signer!r}")
+                sig_bytes = priv_key.sign(WithMsg.rdig.fget(msg))
+            else:
+                signer.public.verify(sig_bytes, WithMsg.rdig.fget(msg))
+            with mod.sql_conn as conn:
+                rowid = conn.execute("""
+                    INSERT INTO signature(sig, signer, mtype, msg)
+                    VALUES(?, ?, ?, ?)
+                    """, (sig_bytes, signer.rid, msg.rtype.rid, msg.rid)
+                ).lastrowid
+                id_ = conn.execute(
+                    "SELECT id FROM signature WHERE rowid = ?", (rowid,))
+            return Signature(mod, id_, sig_bytes, signer, msg)
 
     def __len__(self) -> int:
         cnt, = self._mod.sql_conn.execute("SELECT COUNT(*) FROM signature")
         return cnt
-
-    def add_sig(self, sig_bytes: bytes, signer: Signer, res: Resource
-                ) -> Signature:
-        signer.public.verify(sig_bytes, res.to_bytes())
-        with self._mod.sql_conn as conn:
-            rowid = conn.execute("""
-                INSERT INTO signature(sig, signer, type, res)
-                VALUES(?, ?, ?, ?)""", (sig_bytes, signer.rid,
-                                        res.rtype.rid, res.rid)).lastrowid
-            id_ = conn.execute(
-                "SELECT id FROM signature WHERE rowid = ?", (rowid,))
-        return Signature(id_, sig_bytes, signer, res)
 
     @property
     def rid(self) -> dict[int, Signer]:
@@ -304,23 +355,55 @@ class SignatureMapping(TypedMapping[Signer], Bounded):
         return self.IDMapping(self)
 
     @property
-    def bytes(self) -> SigMapping:
+    def sig(self) -> SigMapping:
+        """Mapping using signature-signer-message pair as key."""
         return self.SigMapping(self)
 
+    sigbyteswrap = FuncWrapper(lambda sig_bytes: (sig_bytes, None, None),
+                               lambda params: params[0],
+                               "sigbyteswrap")
+
+    class BytesWrapper(Wrapper, Inner['SignatureMapping']):
+
+        def extract(self, data: bytes) -> SigParams:
+            sig_bytes = read_by_size(buf := BytesIO(data))
+            signer = read_by_size(buf, not_none=False)
+            msg = (None if signer is None else
+                   self._outer.module.restype_manager.type
+                   .mapping.bytes[read_by_size(buf)]
+                   .mapping.bytes[buf.read()])
+            return sig_bytes, signer, msg
+
+        @staticmethod
+        def expand(params: SigParams) -> bytes:
+            sig_bytes, signer, msg = params
+            if signer is None:
+                return sig_bytes + NULL
+            return pack_with_size(signer.to_bytes()) + WithMsg.to_bytes(msg)
+
+        def __repr__(self):
+            return f"{self.__class.__name__}.byteswrap"
+
     @property
-    def owned_msg(self) -> OwnedMsgMapping:
-        """Mapping using owner-message pair as key."""
-        return self.OwnedMsgMapping(self)
+    def byteswrap(self) -> BytesWrapper:
+        """byteswrap"""
+        return self.BytesWrapper(self)
 
     def read(self, con: Session, buf: BufferedReader) -> Signature:
         mod = self._mod
-        sig_bytes = read_by_size(buf)
-        signer = mod.type_signer.mapping.read(buf)
-        res_type = mod.restype_manager.type.mapping.read(buf)
-        res = res_type.mapping.read(buf)
-        if (sig := self.bytes.get(sig_bytes)) is not None:
-            return sig
-        return self.add_sig(sig_bytes, signer, res)
+        return self.sig[
+            read_by_size(buf),
+            mod.type_signer.mapping.read(buf),
+            mod.restype_manager.type.mapping.read(buf).mapping.read(buf)
+        ]
+
+    @property
+    def bytes(self):
+        pass
+
+    @property
+    def rdig(self) -> WrappedMapping[bytes, Signature, SigParams, Signature]:
+        return WrappedMapping(self.sig, self.sigbyteswrap)
 
     @property
     def rtype(self) -> 'ResType':
@@ -362,9 +445,9 @@ class SigningManager(DataBased):
                 CREATE TABLE IF NOT EXISTS signature(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sig BLOB NOT NULL UNIQUE,
-                    signer INTEGER NOT NULL,
-                    type INTEGER NOT NULL,
-                    res INTEGER NOT NULL
+                    signer INTEGER,
+                    mtype INTEGER,
+                    msg INTEGER
                 );
                 
                 CREATE INDEX IF NOT EXISTS res_index
@@ -445,6 +528,14 @@ class SigningManager(DataBased):
         for signer in signers:
             sync.send(signer, buf)
         con.send(buf.getvalue())
+
+    def sign(self, signer: Signer, res: Resource) -> Signature:
+        """Create a signature of the resource."""
+        return self._type_sig.mapping.sig[None, signer, res]
+
+    def verify(self, sig_bytes: bytes, signer: Signer, res: Resource):
+        """Verify a signature of the resource."""
+        return self._type_sig.mapping.sig[sig_bytes, signer, res]
 
     @property
     def type_signer(self) -> ResType:

@@ -20,17 +20,19 @@ from collections.abc import (
     Sequence,
     Sized
 )
+from dataclasses import dataclass
 from hashlib import new as get_hasher
 from io import BufferedIOBase, BufferedReader, BytesIO
 from itertools import chain as iter_chain
 from queue import Queue
 from secrets import token_bytes
 from threading import RLock, Thread
-from typing import Any, Self, Union
 from weakref import WeakValueDictionary
+from typing import Any, Self, Union
 
 from .ilfocore.constants import ENCODING, Address
 from .ilfocore.utils import (
+    NULL,
     pack_with_size,
     read_by_size,
     read_integral,
@@ -39,39 +41,48 @@ from .ilfocore.utils import (
 )
 from .ilfocore.utils.multithread import call_forever, in_queue
 
-from .basemodule import Bounded, DataBased
-from .decreq import Cryptic as _Cryptic
+from .basemodule import Bounded as _Bounded, DataBased
 from .session import Session
 from .session import DynamicSync, Sync, concat_varname, get_servfunc
 from .session import Fillers, SyncFiller
-from .utils import Inner, OrderedSet, SortedDict, SortedSet
+
+from .decreq import Cryptic as _Cryptic, InnerRes, InnerSer
 from .restype import (
     ResType,
     ResTypeManager,
     Resource,
     Serializable,
     TypedMapping,
-    WithMsg
+    WithMsg,
+    encode
 )
 from .signing import Signer, SigningManager
 
-# IDE
-T = None
+from .utils import Inner, OrderedSet, SortedDict, SortedSet
+from .utils import FuncWrapper, WrappedSequence
+
+
+class Bounded(_Bounded['ABCMM']):
+
+    """New Bounded class."""
+
+    def __init__(self, mod):
+        self._mod = mod
+
+    def module(self) -> 'ABCMM':
+        """ABCMM module."""
+        return self._mod
 
 
 class Cryptic(_Cryptic):
 
-    """New Cryptic class."""
+    """New Cryptic interface."""
 
     __slots__ = ()
 
-    class Material(Serializable, Inner):
-
-        def to_fillers(self, fillers: Fillers):
-            raise NotImplementedError
-
-        def rtype(self):
-            raise NotImplementedError
+    @abstractmethod
+    def Material[T: Cryptic](self) -> InnerSer[T]:
+        """Inner Material class."""
 
     @property
     def material(self) -> Material | None:
@@ -84,17 +95,67 @@ class Hashed(Cryptic):
 
     __slots__ = ()
 
-    @property
-    @abstractmethod
-    def algorithm(self) -> str:
-        """Hash algorithm."""
+    class OtherMat[T: Hashed](InnerRes[T]):
+
+        """Material without hash algorithm."""
+
+        def __eq__(self, other) -> bool:
+            return (self is other
+                    or isinstance(other, self.__class__)
+                    and self.rdig == other.rdig)
+
+        def __hash__(self) -> int:
+            return hash((self.__class__, self.rdig))
+
+        @property
+        def rtype(self) -> bytes:
+            raise NotImplementedError
+
+    class Material[T: Hashed](InnerRes[T]):
+
+        """Material class."""
+
+        def Other(self) -> 'Hashed.OtherMat[T]':
+            """Other material class."""
+            return self._outer.OtherMat
+
+        def to_fillers(self, fillers: Fillers):
+            outer = self._outer
+            fillers.append(SyncFiller(
+                ('ABCMM', 'alg'), alg := outer.algorithm))
+            if alg is None:
+                fillers.append(outer.rdig)
+            else:
+                self.Other(outer).to_fillers(fillers)
+
+        def to_bytes(self) -> bytes:
+            outer = self._outer
+            if (alg := outer.algorithm) is None:
+                return outer.to_bytes()
+            return pack_with_size(encode(alg)) + self.Other(outer).to_bytes()
+
+    def to_fillers(self, fillers: Fillers):
+        fillers.append(NULL + self.rdig)
+
+    def to_bytes(self) -> bytes:
+        return NULL + self.rdig
+
+    def compute_hash(self) -> bytes:
+        """Compute hash of the resource."""
+        return get_hasher(
+            self.algorithm, self.OtherMat(self).to_bytes()
+        ).digest()
 
     @property
     def is_decrypted(self) -> bool:
         return self.algorithm is not None
 
+    @property
+    def algorithm(self) -> str:
+        """Hash algorithm."""
 
-class Salted[T: Resource](WithMsg[T], Resource, Hashed, Bounded):
+
+class Salted[T: Resource](WithMsg[T], Resource, Hashed, _Bounded):
 
     """Cryptic resource with salt."""
 
@@ -110,33 +171,18 @@ class Salted[T: Resource](WithMsg[T], Resource, Hashed, Bounded):
         else:
             self._salt, self._msg = args
 
-    class Material(Cryptic.Material):
+    class OtherMat(InnerRes['Salted']):
 
-        """Material class of Salted class."""
+        """OtherMat class of Salted class."""
 
         def to_fillers(self, fillers: Fillers):
-            salted = self._outer
-            fillers.append(salted.salt)
-            WithMsg.to_fillers(salted, fillers)
+            outer = self._outer
+            fillers.append(outer.salt)
+            WithMsg.to_fillers(outer, fillers)
 
         def to_bytes(self) -> bytes:
-            salted = self._outer
-            return pack_with_size(salted.salt) + WithMsg.to_bytes(salted)
-
-    __eq__ = Serializable.__eq__
-
-    def to_fillers(self, fillers: Fillers):
-        fillers.append(SyncFiller((self._mod, 'alg'), self._alg))
-        if self.is_decrypted:
-            self._material.to_fillers(fillers)
-        else:
-            fillers.append(SyncFiller((self._mod, 'alg'), None))
-            Serializable.to_fillers(self, fillers)
-
-    def to_bytes(self) -> bytes:
-        return get_hasher(
-            self._alg, self._salt + super().to_bytes()
-        ).digest() if self.is_decrypted else self._hash
+            outer = self._outer
+            return pack_with_size(outer.salt) + WithMsg.to_bytes(outer)
 
     @property
     def algorithm(self) -> str:
@@ -157,6 +203,10 @@ class Salted[T: Resource](WithMsg[T], Resource, Hashed, Bounded):
         return self._id
 
     @property
+    def rdig(self) -> bytes:
+        return self.compute_hash() if self.is_decrypted else self._hash
+
+    @property
     def rtype(self) -> ResType:
         """.salted"""
         return self._mod.type_salted
@@ -166,7 +216,7 @@ class Salted[T: Resource](WithMsg[T], Resource, Hashed, Bounded):
         return self._mod
 
 
-class Owned[T: Resource](WithMsg[T], Resource, Bounded):
+class Owned[T: Resource](WithMsg[T], Resource, _Bounded):
 
     """Resource with its owner."""
 
@@ -214,7 +264,7 @@ class Owned[T: Resource](WithMsg[T], Resource, Bounded):
         return self._mod
 
 
-class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
+class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, _Bounded):
 
     """MsgBlock class."""
 
@@ -256,33 +306,47 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
 
         self._lock = RLock()
 
-    class Material(Cryptic.Material):
+    class OtherMat(InnerRes['MsgBlock']):
 
-        """Material class of MsgBlock class."""
+        """OtherMat class of OtherMat class."""
 
-        __slots__ = ()
-
-        @staticmethod
-        def _combine(
-                prev_blks: Iterable['MsgBlock'], msg: Serializable) -> bytes:
-            write_integral(len(prev_blks), buf := BytesIO())
+        def to_fillers(self, fillers: Fillers):
+            outer = self._outer
+            fillers.appned(pack_with_size(len(prev_blks := outer.prev)))
             for blk in prev_blks:
-                write_with_size(blk.to_bytes(), buf)
-            write_with_size(msg.rtype.to_bytes(), buf)
-            write_with_size(msg.to_bytes(), buf)
-            return buf.getvalue()
-
-        @staticmethod
-        def compute_hash(
-            alg: str, prev_blks: Iterable['MsgBlock'], msg: Serializable
-        ) -> bytes:
-            """Compute hash of the block to be constructed."""
-            return get_hasher(
-                alg, MsgBlock.Material._combine(prev_blks, msg)).digest()
+                blk.to_fillers(outer, fillers)
+            fillers.append(outer.salt)
+            WithMsg.to_fillers(outer, fillers)
 
         def to_bytes(self) -> bytes:
-            blk = self._outer
-            return self._combine(blk.prev, blk.msg)
+            outer = self._outer
+            write_integral(len(prev_blks := outer.prev), buf := BytesIO())
+            for blk in prev_blks:
+                write_with_size(blk.to_bytes(), buf)
+            buf.write(WithMsg.to_bytes(outer))
+            return buf.getvalue()
+
+        @property
+        def rdig(self) -> bytes:
+            outer = self._outer
+            write_integral(len(prev_blks := outer.prev), buf := BytesIO())
+            for blk in prev_blks:
+                write_with_size(blk.rdig, buf)
+            buf.write(WithMsg.rdig.fget(outer))
+            return buf.getvalue()
+
+    def compute_hash(self, *args) -> bytes:
+        """Compute hash of the block to be constructed."""
+        if args:
+            alg, prev_blks, msg = self, *args
+            write_integral(len(prev_blks), buf := BytesIO())
+            for blk in prev_blks:
+                write_with_size(blk.rdig, buf)
+            write_with_size(msg.rtype.rdig, buf)
+            write_with_size(msg.rdig, buf)
+            return get_hasher(alg, buf.getvalue()).digest()
+
+        return super().compute_hash()
 
     @classmethod
     def unknown_block(cls, mod: 'ABCMM', id_: int, chain_id: int, pos: int,
@@ -291,11 +355,15 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
         return cls(mod, id_, chain_id, pos, hash_)
 
     def to_fillers(self, fillers: Fillers):
-        fillers.append(SyncFiller((self._mod, 'msgblk'), self._hash))
+        fillers.append(SyncFiller((self._mod, 'msgblk'), self.rdig))
 
-    def to_bytes(self) -> bytes:
+    @property
+    def rdig(self) -> bytes:
         self.load_data()
         return self._hash
+
+    def to_bytes(self) -> bytes:
+        return NULL + self.rdig
 
     def __repr__(self) -> str:
         cls_name = self.__class__.__name__
@@ -425,12 +493,12 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
             return
         mod = self._mod
         if self.loaded_chain:
-            (chain := self._chain).load_hash(*mod.find_range(
+            (chain := self._chain).load_hash(*mod.find_to_load(
                 chain, self._pos, MsgBlock.loaded_hash.fget))
             return
 
         chain_id, pos, self._hash, alg, *left = next(mod.sql_conn.execute("""
-            SELECT hash, alg, salt, owner, type, res FROM soblock WHERE id = ?
+            SELECT hash, alg, salt, owner, mtype, msg FROM soblock WHERE id = ?
             """, (id_ := self._id,)))
         if alg is not None:
             self._alg = alg
@@ -443,7 +511,7 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
     def prev_ids(self) -> tuple[int]:
         """The IDs of previous blocks."""
         if not self.loaded_prev:
-            (chain := self._chain).load_branch(*self._mod.find_range(
+            (chain := self._chain).load_branch(*self._mod.find_to_load(
                 chain, self._pos, MsgBlock.loaded_prev.fget), True)
         return self._prev_ids
 
@@ -451,21 +519,21 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
     def next_ids(self) -> OrderedSet[int]:
         """The IDs of next blocks."""
         if not self.loaded_next:
-            (chain := self._chain).load_branch(*self._mod.find_range(
+            (chain := self._chain).load_branch(*self._mod.find_to_load(
                 chain, self._pos, MsgBlock.loaded_next.fget), False)
         return self._next_ids
 
     @property
-    def prev(self) -> Iterator[Self]:
+    def prev(self) -> WrappedSequence[Self, int]:
         """Previous blocks."""
-        for id_ in self.prev_ids:
-            yield self._mod.type_msgblk.mapping.rid[id_]
+        return WrappedSequence(self._prev_ids, FuncWrapper(
+            MsgBlock.rid.fget, self._mod.type_msgblk.mapping.rid.__getitem__))
 
     @property
-    def next(self) -> Iterator[Self]:
+    def next(self) -> WrappedSequence[Self, int]:
         """Next blocks."""
-        for id_ in self.next_block_ids:
-            yield self._mod.type_msgblk.mapping.rid[id_]
+        return WrappedSequence(self._next_ids, FuncWrapper(
+            MsgBlock.rid.fget, self._mod.type_msgblk.mapping.rid.__getitem__))
 
     @property
     def signatures(self) -> dict[int, bytes]:
@@ -505,7 +573,7 @@ class MsgBlock[T: Serializable](WithMsg[T], Resource, Cryptic, Bounded):
         return self._mod
 
 
-class BrokenGraph(Resource, Bounded):
+class BrokenGraph(Resource, _Bounded):
 
     """Acyclic graph of blocks whose iteration
     can be stopped by a block with specific body.
@@ -519,17 +587,16 @@ class BrokenGraph(Resource, Bounded):
                  breaker: Serializable | None = None):
         self._mod = mod
         self._id = id_
-        end = set(end)
-        start = set(start) - end
-        end |= start
         self._start, self._end = start, end
         self._breaker = breaker
 
     def _iter(self, reverse: bool) -> Iterator[MsgBlock]:
-        next_lvl = list(self._start)
-        end = {
-            blk: (len(blk.next) if reverse else len(blk.prev_ids)) - 1
-            for blk in self._end}
+        end = set(self._end)
+        start = set(self._start) - end
+        end |= start
+        next_lvl = list(start)
+        end = {blk: (len(blk.next) if reverse else len(blk.prev_ids)) - 1
+               for blk in end}
         while next_lvl:
             curr_lvl = next_lvl.copy()
             next_lvl.clear()
@@ -581,6 +648,9 @@ class BrokenGraph(Resource, Bounded):
         return self._mod
 
 
+type Finder = Callable[[Chain, int], tuple[int, int]]
+
+
 class Graph(BrokenGraph):
 
     """Acyclic graph of blocks."""
@@ -591,13 +661,35 @@ class Graph(BrokenGraph):
                  start: Iterable[MsgBlock], end: Iterable[MsgBlock]):
         super().__init__(mod, id_, start, end)
 
+    def __contains__(self, blk: MsgBlock):
+        if not isinstance(blk, MsgBlock):
+            raise ValueError(blk)
+        for start in self._start:
+            chain = start.chain
+            start_pos = start.position
+            end_pos = None
+            for end in self._end:
+                if end in chain:
+                    pos = end.position
+                    if end_pos is None or pos < end_pos:
+                        end_pos = pos
+
+    @property
+    def rdig(self) -> bytes:
+        write_integral(len(start := self._start), buf := BytesIO())
+        for blk in start:
+            write_with_size(blk.rdig, buf)
+        for blk in self._end:
+            write_with_size(blk.rdig, buf)
+        return buf.getvalue()
+
     @property
     def rtype(self) -> ResType:
         """.graph"""
         return self._mod.type_graph
 
 
-class Chain(Sequence[MsgBlock], Bounded):
+class Chain(Sequence[MsgBlock], _Bounded):
 
     """Chain."""
 
@@ -614,7 +706,7 @@ class Chain(Sequence[MsgBlock], Bounded):
         """Return the length of chain."""
         if (len_ := self._len) is None:
             max_ = next(self._mod.sql_conn.execute(
-                "SELECT MAX(pos) FROM block WHERE chain = ?", (self._id,)))[0]
+                "SELECT MAX(pos) FROM soblock WHERE chain = ?", (self._id,)))[0]
             self._len = len_ = max_ + 1 if max_ is not None else 0
         return len_
 
@@ -657,8 +749,8 @@ class Chain(Sequence[MsgBlock], Bounded):
             if (blk := pos_blks.get(key, None)) is not None:
                 mod.id_blocks.move_to_end(blk.rid)
                 return blk
-            self.load_hash(*mod.find_range(self, key,
-                           MsgBlock.loaded_hash.fget))
+            self.load_hash(*mod.find_to_load(
+                self, key, MsgBlock.loaded_hash.fget))
             return pos_blks[key]
 
         start, stop, step = key.indices(len(self))
@@ -695,7 +787,7 @@ class Chain(Sequence[MsgBlock], Bounded):
         items = pos_blks.items()
         j = keys.bisect(stop, i := 0)
         for pos, *left in (rsl := mod.sql_conn.execute("""
-                SELECT pos, id, hash, alg, owner, salt, type, res FROM block
+                SELECT pos, id, hash, alg, salt, owner, mtype, msg FROM soblock
                 WHERE chain = ? AND pos BETWEEN ? AND ? ORDER BY pos
                 """, (self._id, start, stop - 1))):
             if (i := keys.bisect(pos, i, j)) >= len(keys):
@@ -711,24 +803,17 @@ class Chain(Sequence[MsgBlock], Bounded):
     def load_branch(self, start: int, stop: int, prev: bool = None):
         """Load blk.prev_ids and blk.next_block_ids."""
         if prev is None:
-            self.load_branches(start, stop, True)
+            self.load_branch(start, stop, True)
             prev = False
         blks = self[start: stop]
-        end = stop - 1
         if prev:
-            rsl = self._mod.sql_conn.execute("""
-                SELECT next_pos, prev_id FROM branch
-                WHERE next_chain = ? AND next_pos BETWEEN ? AND ?
-                ORDER BY next_pos
-                """, (self._id, start + 1 if start else start, end))
+            if start:
+                start += 1
         else:
             blks = reversed(blks)
-            rsl = self._mod.sql_conn.execute("""
-                SELECT prev_pos, next_id FROM branch
-                WHERE prev_chain = ? AND prev_pos BETWEEN ? AND ?
-                ORDER BY prev_pos DESC
-                """, (self._id, start, end - 1 if stop < len(self) else end))
-        row = next(rsl, None)
+            if stop < len(self):
+                stop -= 1
+        item = next(items := self.branches(start, stop, prev), None)
         last: int = None
         for blk in blks:
             pos = blk.position
@@ -740,19 +825,48 @@ class Chain(Sequence[MsgBlock], Bounded):
                     blk._next_ids = next_ids = OrderedSet()
                     if pos < len(self) - 1:
                         next_ids.add(last)
-            while row is not None and row[0] == pos:
-                if to_load:
-                    if prev:
-                        prev_ids.apppend(row[1])
-                    else:
-                        next_ids.add(row[1])
-                row = next(rsl, None)
+            while item is not None:
+                pos_brc, brc_id, *_ = item
+                if pos_brc == pos:
+                    if to_load:
+                        if prev:
+                            prev_ids.apppend(brc_id)
+                        else:
+                            next_ids.add(brc_id)
+                    item = next(items, None)
             if to_load and prev:
                 blk._prev_ids = tuple(prev_ids)
             last = blk.rid
             if to_load:
                 logging.debug(
                     f"{blk.rid} load context {prev_ids if prev else next_ids}")
+
+    def branches(self, start=0, stop: int = None, prev=True
+                 ) -> Iterator[tuple[int, tuple[int, int, int]]]:
+        """Return iterator of (pos, brc_id, brc_chain, brc_pos) tuple."""
+        end = stop - 1 if stop is not None else len(self)
+        if prev:
+            rsl = self._mod.sql_conn.execute("""
+                SELECT next_pos, prev_id, prev_chain, prev_pos FROM branch
+                WHERE next_chain = ? AND next_pos BETWEEN ? AND ?
+                ORDER BY next_pos
+                """, (self._id, start, end))
+        else:
+            rsl = self._mod.sql_conn.execute("""
+                SELECT prev_pos, next_id, next_chain, next_pos FROM branch
+                WHERE prev_chain = ? AND prev_pos BETWEEN ? AND ?
+                ORDER BY prev_pos DESC
+                """, (self._id, start, end))
+        yield from rsl
+
+    def find_slices(self, pos: int, finding: list['Chain', int, int],
+                    find: Finder = None):
+        rang = find(self, pos) if find is not None else (pos, pos)
+        finding.append((self, *rang))
+        for _, brc in self.branches:
+            chain, pos = brc
+            if chain is not self:
+                chain.find_slice(pos, finding, find)
 
     @property
     def id(self) -> int:
@@ -769,118 +883,74 @@ class Chain(Sequence[MsgBlock], Bounded):
         return self._mod
 
 
-CheckFunc = Callable[[MsgBlock], bool]
+type CheckFunc = Callable[[MsgBlock], bool]
+type ToLoadFinder = Callable[[Chain, int, CheckFunc], tuple[int, int]]
 
 
-RangeFinder = Callable[[Chain, int, CheckFunc], tuple[int, int]]
+@dataclass(slots=True)
+class MonoToLoadFinder:
 
+    """Monodirected to-load range finder class."""
 
-def find_mono(chain: Chain, pos: int, maxoff: int, step: int,
-              check: CheckFunc) -> int:
-    """Find a position mono-directly."""
-    keys = chain.blocks.keys()
-    values = chain.blocks.values()
+    maxlen: int
+    step: int
 
-    stop = pos + maxoff
-    for i in range(keys.bisect(pos), j := len(keys), step):
-        if (new := keys[i]) >= stop:
-            break
-        if check(values[i]):
-            stop = new
-            break
-    else:
-        if stop > j:
-            stop = j
-    return stop
+    def find_mono(self, chain: Chain, pos: int, check: CheckFunc
+                  ) -> int:
+        """Find a position mono-directly."""
+        keys = chain.blocks.keys()
+        values = chain.blocks.values()
 
-
-class BidirectedFinder(RangeFinder):
-
-    """Bidirected range finder class."""
-
-    __slots__ = '_backward', '_forward'
-
-    def __init__(self, backward: int, forward: int):
-        self._backward = backward
-        self._forward = forward
+        stop = pos + self.maxlen
+        for i in range(keys.bisect(pos), j := len(keys), self.step):
+            if (new := keys[i]) >= stop:
+                break
+            if check(values[i]):
+                stop = new
+                break
+        else:
+            if stop > j:
+                stop = j
+        return stop
 
     def __call__(self, chain: Chain, pos: int, check: CheckFunc
                  ) -> tuple[int, int]:
-        """Call to get range from a position."""
-        return (find_mono(chain, pos, self._forward, 1, check),
-                find_mono(chain, pos, self._backward, -1, check))
-
-    @property
-    def backward(self) -> int:
-        """Backward offset."""
-        return self._off
-
-    @backward.setter
-    def backward(self, value: int):
-        """Set backward offset."""
-        if not isinstance(value, int):
-            raise TypeError(type(value))
-        self._backward = value
-
-    @property
-    def forward(self) -> int:
-        """Forward offset."""
-        return self._from
-
-    @forward.setter
-    def forward(self, value: int):
-        """Set forward offset."""
-        if not isinstance(value, int):
-            raise TypeError(type(value))
-        self._forward = value
+        stop = self.find_mono(chain, pos, check)
+        return (pos, stop) if pos <= stop else (stop, pos)
 
 
-class LimitedFinder(RangeFinder):
+@dataclass(slots=True)
+class BiToLoadFinder:
 
-    """Limited range finder class."""
+    """Bidirected to-load range finder class."""
 
-    __slots__ = '_maxlen', '_off'
-
-    def __init__(self, maxlen: int, offset: int | None = None):
-        self._maxlen = maxlen
-        self._off = offset
+    backward: int
+    forward: int
 
     def __call__(self, chain: Chain, pos: int, check: CheckFunc
                  ) -> tuple[int, int]:
-        """Call to get range from a position."""
-        maxlen = self._maxlen
-        off = self._off
-        from_ = find_mono(chain, pos, off, -1, check)
-        to = find_mono(chain, pos, maxlen + off, 1, check)
+        return (
+            MonoToLoadFinder(self.forward, 1).find_mono(chain, pos, check),
+            MonoToLoadFinder(self.backward, -1).find_mono(chain, pos, check)
+        )
+
+
+@dataclass(slots=True)
+class TotalToLoadFinder:
+
+    """To-load range finder whose result range length is limited."""
+
+    maxlen: int
+    offset: int | None = None
+
+    def __call__(self, chain: Chain, pos: int, check: CheckFunc
+                 ) -> tuple[int, int]:
+        maxlen, off = self.maxlen, self.offset
+        from_ = MonoToLoadFinder(off, -1).find_mono(chain, pos, check)
+        to = MonoToLoadFinder(maxlen + off, 1).find_mono(chain, pos, check)
         if (diff := to - from_ - maxlen) < 0:
-            from_ = find_mono(chain, from_, diff, -1, check)
+            from_ = MonoToLoadFinder(diff, -1).find_mono(chain, pos, check)
         return from_, to
-
-    @property
-    def maxlen(self) -> int:
-        """The maximum length of the range."""
-        return self._maxlen
-
-    @maxlen.setter
-    def maxlen(self, value: int):
-        """Bounded to the specified maximum length."""
-        if not isinstance(value, int):
-            raise TypeError(type(value))
-        if value <= 0:
-            raise ValueError(value)
-        self._maxlen = value
-
-    @property
-    def offset(self) -> int:
-        """Offset."""
-        return self._off
-
-    @offset.setter
-    def offset(self, value: int):
-        """Set offset."""
-        if not isinstance(value, int):
-            raise TypeError(type(value))
-        self._off = value
 
 
 def _ser_str(str_: str, buf: BufferedIOBase) -> int:
@@ -898,10 +968,18 @@ def _deser_alg(buf: BufferedReader) -> str | None:
     return get_hasher(_deser_str(buf)).name
 
 
-class SaltedMapping(TypedMapping[Salted], Bounded):
+class InnerMapping[KT, VT: Serializable, MT: TypedMapping](
+        Mapping[KT, VT], Inner[MT]):
 
-    def __init__(self, mod: 'ABCMM'):
-        self._mod = mod
+    """Inner mapping class."""
+
+    def __len__(self) -> int:
+        return len(self._outer)
+
+
+class SaltedMapping(TypedMapping, Bounded):
+
+    type _InnerMapping[KT] = InnerMapping[KT, Salted, 'SaltedMapping']
 
     def __len__(self) -> int:
         conn = self._mod.sql_conn
@@ -910,10 +988,7 @@ class SaltedMapping(TypedMapping[Salted], Bounded):
         hidden, = next(conn.execute("SELECT COUNT(*) FROM salted_hash"))
         return not_hidden + hidden
 
-    class IDMapping(Mapping[int, Salted], Inner['SaltedMapping']):
-
-        def __len__(self) -> int:
-            return len(self._outer)
+    class IDMapping(_InnerMapping[int]):
 
         def __getitem__(self, key: int) -> Salted:
             outer = self._outer
@@ -927,23 +1002,36 @@ class SaltedMapping(TypedMapping[Salted], Bounded):
         """Mapping using ID as key."""
         return self.IDMapping(self)
 
-    class HashMapping(Mapping[bytes, Salted], Inner['SaltedMapping']):
-
-        def __len__(self) -> int:
-            return len(self._outer)
+    class HashMapping(_InnerMapping[bytes]):
 
         def __getitem__(self, key: bytes) -> Salted:
             return Salted(self._outer.mod, None, None, key)
 
     @property
-    def bytes(self) -> HashMapping:
+    def hash(self) -> HashMapping:
+        """Mapping using hash as key."""
         return self.HashMapping(self)
+
+    class BytesMapping(_InnerMapping[bytes]):
+
+        def __getitem__(self, key: bytes) -> Salted:
+            mod = self._outer.module
+            buf = BytesIO(key)
+            if (alg := read_by_size(buf, not_none=False)) is None:
+                return self.hash[read_by_size(buf)]
+            salt = read_by_size(buf)
+            type_ = mod.restype_manager.type.mapping.bytes[read_by_size(buf)]
+            msg = type_.mapping.bytes[buf.read()]
+            return Salted(mod, None, alg, salt, msg)
+
+    @property
+    def bytes(self) -> BytesMapping:
+        return self.BytesMapping(self)
 
     def read(self, con: Session, buf: BufferedReader) -> Salted:
         mod = self._mod
         if (alg := read_by_size(buf, not_none=False)) is None:
-            hash_ = read_by_size(buf)
-            return Salted(mod, None, alg, hash_)
+            return self.hash[read_by_size(buf)]
         salt = read_by_size(buf)
         type_ = mod.restype_manager.type.mapping.read(con, buf)
         msg = type_.mapping.read(con, buf)
@@ -954,27 +1042,19 @@ class SaltedMapping(TypedMapping[Salted], Bounded):
         """.salted"""
         return self._mod.type_salted
 
-    @property
-    def module(self) -> 'ABCMM':
-        return self._mod
-
 
 class OwnedMapping(TypedMapping[Owned], Bounded):
 
     """Owned resource mapping."""
 
-    def __init__(self, mod: 'ABCMM'):
-        self._mod = mod
+    type _InnerMapping[KT] = InnerMapping[KT, Owned, 'OwnedMapping']
 
     def __len__(self) -> int:
         cnt, = next(self._mod.sql_conn.execute(
             "SELECT COUNT(*) FROM soblock WHERE owner IS NOT NULL"))
         return cnt
 
-    class IDMapping(Mapping[int, Owned], Inner['OwnedMapping']):
-
-        def __len__(self) -> int:
-            return len(self._outer)
+    class IDMapping(_InnerMapping[int]):
 
         def __getitem__(self, key: int) -> Salted:
             outer = self._outer
@@ -988,18 +1068,14 @@ class OwnedMapping(TypedMapping[Owned], Bounded):
         """Mapping using ID as key."""
         return self.IDMapping(self)
 
-    class BytesMapping(Mapping[bytes, Owned], Inner['OwnedMapping']):
-
-        def __len__(self) -> int:
-            return len(self._outer)
+    class BytesMapping(_InnerMapping[bytes]):
 
         def __getitem__(self, key: bytes) -> Salted:
             mod = self._outer.module
             signer = mod.signing_manager.type_signer.mapping.bytes[
                 read_by_size(buf := BytesIO(key))]
-            type_ = mod.restype_manager.type.mapping.bytes[
-                read_by_size(buf)]
-            msg = type_.mapping.bytes[read_by_size(buf)]
+            type_ = mod.restype_manager.type.mapping.bytes[read_by_size(buf)]
+            msg = type_.mapping.bytes[buf.read()]
             return Owned(mod, None, signer, msg)
 
     @property
@@ -1018,22 +1094,13 @@ class OwnedMapping(TypedMapping[Owned], Bounded):
         """.owned"""
         return self._mod.type_owned
 
-    @property
-    def module(self) -> 'ABCMM':
-        return self._mod
-
 
 class MsgBlkMapping(TypedMapping[MsgBlock], Bounded):
 
     """MsgBlock mapping."""
 
-    def __init__(self, mod: 'ABCMM'):
-        self._mod = mod
-        self._id_map = self.IDMapping(self)
-        self._hash_map = self.HashMapping(self)
-
     def __len__(self) -> int:
-        cnt, = next(self._mod.sql_conn.execute("SELECT COUNT(*) FROM block"))
+        cnt, = next(self._mod.sql_conn.execute("SELECT COUNT(*) FROM soblock"))
         return cnt
 
     class IDMapping(UserDict[int, MsgBlock], Inner['MsgBlkMapping']):
@@ -1062,8 +1129,8 @@ class MsgBlkMapping(TypedMapping[MsgBlock], Bounded):
             outer.spare()
             mod = outer.module
             if (row := next(mod.sql_conn.execute("""
-                    SELECT id, chain, pos, hash, alg, owner, salt, type, data
-                    FROM block WHERE hash = ?
+                    SELECT id, chain, pos, hash, alg, salt, owner, mtype, msg
+                    FROM soblock WHERE hash = ?
                     """, (key,)), None)) is None:
                 return default
 
@@ -1085,6 +1152,11 @@ class MsgBlkMapping(TypedMapping[MsgBlock], Bounded):
         def __setitem__(self, key: int, value: MsgBlock):
             self._outer.spare()
             self.data[key] = value
+
+    @property
+    def rid(self) -> IDMapping:
+        """Mapping using ID as key."""
+        return self.IDMapping(self)
 
     class HashMapping(UserDict[bytes, MsgBlock], Inner['MsgBlkMapping']):
 
@@ -1109,8 +1181,8 @@ class MsgBlkMapping(TypedMapping[MsgBlock], Bounded):
             outer.spare()
             mod = outer.module
             if (row := next(mod.sql_conn.execute("""
-                    SELECT id, chain, pos, hash, alg, owner, salt, type, data
-                    FROM block WHERE hash = ?
+                    SELECT id, chain, pos, hash, alg, salt, owner, mtype, msg
+                    FROM soblock WHERE hash = ?
                     """, (key,)), None)) is None:
                 return default
 
@@ -1127,15 +1199,26 @@ class MsgBlkMapping(TypedMapping[MsgBlock], Bounded):
             logging.debug("gen blk %r", key)
             with mod.sql_conn as conn:
                 rowid = conn.execute(
-                    "INSERT INTO block(hash, chain, pos) VALUES(?, ?, 0)",
+                    "INSERT INTO soblock(hash, chain, pos) VALUES(?, ?, 0)",
                     (key, chain_id := mod._new_chain_id)
                 ).lastrowid
                 id_, = next(conn.execute(
-                    "SELECT id FROM block WHERE rowid = ?", (rowid,)))
+                    "SELECT id FROM soblock WHERE rowid = ?", (rowid,)))
             outer.rid.data[blk.rid] = blk = MsgBlock.unknown_block(
                 mod, id_, Chain(mod, chain_id), 0, key)
             self.data[key] = blk
             return blk
+
+    @property
+    def rdig(self) -> HashMapping:
+        return self.HashMapping(self)
+
+    class BytesMapping():
+        pass
+
+    @property
+    def bytes(self) -> BytesMapping:
+        return self.BytesMapping(self)
 
     def spare(self) -> int | None:
         """Pop a block from ID-block dict if it is full."""
@@ -1149,20 +1232,13 @@ class MsgBlkMapping(TypedMapping[MsgBlock], Bounded):
         return None
 
     def read(self, con: Session, buf: BufferedReader) -> MsgBlock:
-        return con.syncs[self._mod, 'msgblk'].read(buf)
+        con.syncs[self._mod, 'msgblk'].read(buf)
+        pass
 
     @property
-    def rid(self) -> IDMapping:
-        """Mapping using ID as key."""
-        return self._id_map
-
-    @property
-    def bytes(self) -> HashMapping:
-        return self._hash_map
-
-    @property
-    def module(self) -> 'ABCMM':
-        return self._mod
+    def rtype(self) -> ResType:
+        """.msgblk"""
+        return self._mod.type_msgblk
 
 
 in_queue = in_queue('_queue')
@@ -1181,14 +1257,14 @@ class ABCMM(DataBased):
         chains_maxlen=1024,
         sync_blocks_maxlen=128,
         chain_compatability=0,
-        find_range=LimitedFinder(16)
+        find_to_load=TotalToLoadFinder(16)
     ):
         super().__init__()
         self._blks_maxlen = blocks_maxlen
         self._chains_maxlen = chains_maxlen
         self._syncblks_maxlen = sync_blocks_maxlen
         self._chain_cmpt = chain_compatability
-        self.find_range = find_range
+        self.find_to_load = find_to_load
 
         self._rtyper: ResTypeManager = None
         self._singer: SigningManager = None
@@ -1228,8 +1304,8 @@ class ABCMM(DataBased):
                     owner INTEGER,
                     salt BLOB,
                     
-                    type INTEGER,
-                    res INTERGER,
+                    mtype INTEGER,
+                    msg INTERGER,
                     
                     UNIQUE(chain, pos)
                 );
@@ -1243,16 +1319,18 @@ class ABCMM(DataBased):
                     next_pos INTEGER NOT NULL
                 );
                 
-                CREATE TABLE IF NOT EXISTS signed_block(
-                    blk INTEGER NOT NULL,
+                CREATE TABLE IF NOT EXISTS signed_chain(
+                    chain INTEGER NOT NULL,
+                    start INTEGER NOT NULL,
+                    end INTEGER NOT NULL,
                     signer INTEGER NOT NULL
                 );
                 
                 CREATE UNIQUE INDEX IF NOT EXISTS chain_index
-                ON block(chain, pos);
-                CREATE UNIQUE INDEX IF NOT EXISTS hash_index ON block(hash);
-                CREATE INDEX IF NOT EXISTS owner_index ON block(owner);
-                CREATE INDEX IF NOT EXISTS type_index ON block(type);
+                ON soblock(chain, pos);
+                CREATE UNIQUE INDEX IF NOT EXISTS hash_index ON soblock(hash);
+                CREATE INDEX IF NOT EXISTS owner_index ON soblock(owner);
+                CREATE INDEX IF NOT EXISTS mtype_index ON soblock(mtype);
                 
                 CREATE INDEX IF NOT EXISTS branch_prev_index
                 ON branch(prev_chain, prev_pos);
@@ -1263,12 +1341,12 @@ class ABCMM(DataBased):
                 ON signed_block(blk);
             """)
 
-            last = next(conn.execute("SELECT MAX(chain) FROM block"))[0]
+            last = next(conn.execute("SELECT MAX(chain) FROM soblock"))[0]
             if last is None:
                 last = 0
             self._max_chain_id = last
             (chains := SortedSet())[:] = conn.execute(
-                "SELECT DISTINCT chain FROM block ORDER BY chain")
+                "SELECT DISTINCT chain FROM soblock ORDER BY chain")
 
         (losts := self._lost_chain_ids)[:] = range(1, last)
         losts -= chains
@@ -1413,7 +1491,8 @@ class ABCMM(DataBased):
         """Convert a block from its materials."""
         logging.debug("construct blk alg %r, prev %r, msg %r",
                       alg, prev_blks, msg)
-        hash_ = MsgBlock.Material.compute_hash(alg, prev_blks, msg)
+        MsgBlock()
+        hash_ = MsgBlock.compute_hash(alg, prev_blks, msg)
         with self._sql_conn as conn:
             blk = self._type_msgblk.mapping.bytes.get(hash_)
             if blk is not None:
@@ -1467,8 +1546,8 @@ class ABCMM(DataBased):
                         return blk
                 blk._msg = msg
                 conn.execute("""
-                    UPDATE block
-                    SET alg = ?, salt = ?, owner = ?, type = ?, res = ?
+                    UPDATE soblock
+                    SET alg = ?, salt = ?, owner = ?, mtype = ?, msg = ?
                     WHERE id = ?
                     """, (alg, salt, owner_id, msg.rtype.rid, msg.rid, blk_id))
                 return blk
@@ -1495,14 +1574,14 @@ class ABCMM(DataBased):
                 # Do chain-exchange
                 # Exchage columns of table block
                 conn.execute("""
-                    UPDATE block SET chain = -1, pos = pos - ?
+                    UPDATE soblock SET chain = -1, pos = pos - ?
                     WHERE chain = ? AND pos >= ?
                     """, (off, prev_chain_id := prev_chain.id, off))
                 conn.execute("""
-                    UPDATE block SET chain = ?, pos = pos + ?
+                    UPDATE soblock SET chain = ?, pos = pos + ?
                     WHERE chain = ?""", (prev_chain_id, off, chain_id))
                 conn.execute(
-                    "UPDATE block SET chain = ? WHERE chain = -1", (chain_id,))
+                    "UPDATE soblock SET chain = ? WHERE chain = -1", (chain_id,))
 
                 # Exchange columns of table branch
                 conn.execute("""
@@ -1567,13 +1646,13 @@ class ABCMM(DataBased):
             salt, owner, body = self.to_sob(msg)
             owner_id = None if owner is None else owner.rid
             rowid = conn.execute("""
-                INSERT INTO block(
-                    hash, chain, pos, alg, owner, salt, type, res
+                INSERT INTO soblock(
+                    hash, chain, pos, alg, salt, owner, mtype, msg
                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""", (
                 hash_, chain_id, pos,
-                alg, owner_id, salt, body.rtype.rid, body.rid)).lastrowid
+                alg, salt, owner_id, body.rtype.rid, body.rid)).lastrowid
             blk_id = next(conn.execute(
-                "SELECT id FROM block WHERE rowid = ?", (rowid,)))[0]
+                "SELECT id FROM soblock WHERE rowid = ?", (rowid,)))[0]
             blk = MsgBlock(self, blk_id, chain, pos, hash_,
                            alg, msg,
                            tuple(prev_blk.rid for prev_blk in prev_blks),
@@ -1779,10 +1858,10 @@ class ABCMM(DataBased):
 
     @property
     def restype_manager(self) -> ResTypeManager:
-        """RTypeMapping instance bounded."""
+        """RTypeMapping instance _Bounded."""
         return self._rtyper
 
     @property
     def signing_manager(self) -> ResTypeManager:
-        """SigningManager instance bounded."""
+        """SigningManager instance _Bounded."""
         return self._singer

@@ -14,7 +14,8 @@ from abc import abstractmethod
 
 from .basemodule import Module
 from .session import Session
-from .restype import ResTypeManager, Serializable
+from .restype import ResType, ResTypeManager, Resource, Serializable
+from .utils import Inner
 
 
 class Cryptic(Serializable):
@@ -35,6 +36,31 @@ class Cryptic(Serializable):
     def has_access(self, con: Session) -> bool:
         """If other has access to the material."""
         raise NotImplementedError
+
+
+class InnerSer[T: Serializable](Serializable, Inner[T]):
+
+    """Inner Serializable class."""
+
+    @property
+    def rtype(self) -> ResType:
+        return self._outer.rtype
+
+    @property
+    def rdig(self) -> bytes:
+        return self._outer.rdig
+
+
+class InnerRes[T: Resource](InnerSer[T]):
+
+    """Inner Resource class."""
+
+    __eq__ = Serializable.__eq__
+    __hash__ = Serializable.__hash__
+
+    @property
+    def rid(self) -> int:
+        return self._outer.rid
 
 
 class ResReqManager(Module):

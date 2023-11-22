@@ -148,7 +148,7 @@ class Module(ABC):
         return f"module {self.name}"
 
 
-class Bounded(ABC):
+class Bounded[T: Module](ABC):
 
     """Object bounded with a module."""
 
@@ -156,7 +156,7 @@ class Bounded(ABC):
 
     @property
     @abstractmethod
-    def module(self) -> Module:
+    def module(self) -> T:
         """The Module which object bounded with."""
 
 

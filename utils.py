@@ -21,9 +21,9 @@ __all__ = [
     'SortedDict',
 
     'Wrapper',
-    'NoWrapper',
     'nowrap',
     'WrappedMapping',
+    'WrappedSequence',
 
     'Inner'
 ]
@@ -56,10 +56,6 @@ from types import (
 )
 from typing import Any as _Any, Self as _Self
 from weakref import proxy as _proxy
-
-# IDE
-T, CT, DT, KT, VT = None, None, None, None, None
-WT, WKT, WVT = None, None, None
 
 
 def distinguish_adjacent[T](iterable: _Iterable[T]) -> _Iterator[T]:
@@ -330,8 +326,8 @@ class _OrderedListValuesView[T](_ValuesView[T]):
 
     __slots__ = ()
 
-    def __contains__(self, obj: T, /) -> bool:
-        return obj in self._mapping
+    def __contains__(self, value: T, /) -> bool:
+        return value in self._mapping
 
     def __iter__(self) -> _Iterator[int]:
         for i in (mapping := self._mapping).keys():
@@ -430,7 +426,7 @@ class OrderedList[T](list[T]):
         for i in to_del:
             del self[i]
 
-    def insert(self, i: int, obj: T, /):
+    def insert(self, i: int, value: T, /):
         """Insert object before index."""
         for link in self.__list[i:]:
             link.key += 1
@@ -439,9 +435,9 @@ class OrderedList[T](list[T]):
         self.__list.insert(i, link := _Link())
         link.prev, link.next, link.key = last, root, i
         root.prev = _proxy(link)
-        super().insert(i, obj)
+        super().insert(i, value)
 
-    def append(self, obj: T, /):
+    def append(self, value: T, /):
         """Append object to the end of the list."""
         self.__list.append(link := _Link())
         root = self.__root
@@ -449,7 +445,7 @@ class OrderedList[T](list[T]):
         link.prev, link.next, link.key = last, root, len(self)
         last.next = link
         root.prev = _proxy(link)
-        super().append(obj)
+        super().append(value)
 
     def clear(self):
         """Remove all items from list."""
@@ -521,7 +517,7 @@ class OrderedList[T](list[T]):
         """Remove and return item at index."""
         if i < 0:
             i += len(self)
-        obj = super().pop(i)
+        value = super().pop(i)
         link = self.__list.pop(i)
         link_prev = link.prev
         link_next = link.next
@@ -529,7 +525,7 @@ class OrderedList[T](list[T]):
         link_next.prev = link_prev
         link.prev = None
         link.next = None
-        return obj
+        return value
 
     @_recursive_repr()
     def __repr__(self) -> str:
@@ -598,49 +594,49 @@ class SortedSet[T](list[T], _MutableSet[T], Sorted[T]):
             other = distinguish_adjacent(other)
         return other
 
-    def __contains__(self, obj: T, /) -> bool:
-        return self.exist(self.bisect(obj), obj)
+    def __contains__(self, value: T, /) -> bool:
+        return self.exist(self.bisect(value), value)
 
     def __sizeof__(self):
         return sum(_sizeof(getattr(self, name)) for name in self.__slots__)
 
-    def bisect(self, obj: T, start=0, stop: int = None, /) -> int:
+    def bisect(self, value: T, start=0, stop: int = None, /) -> int:
         """Return the index where to insert item in self."""
-        return _bisect_left(self, obj, start, stop, key=self.__key)
+        return _bisect_left(self, value, start, stop, key=self.__key)
 
-    def exist(self, i: int, obj: T, /) -> bool:
-        """Return self[i] == obj.
+    def exist(self, i: int, value: T, /) -> bool:
+        """Return self[i] == value.
         Return False if index not out of range.
 
         """
-        return i < len(self) and self[i] == obj
+        return i < len(self) and self[i] == value
 
-    def index(self, obj: T, start=0, stop: int = None, /) -> int:
-        if self.exist(i := self.bisect(obj, start, stop), obj):
+    def index(self, value: T, start=0, stop: int = None, /) -> int:
+        if self.exist(i := self.bisect(value, start, stop), value):
             return i
-        raise ValueError(obj)
+        raise ValueError(value)
 
-    def count(self, obj: T, /) -> int:
-        return int(obj in self)
+    def count(self, value: T, /) -> int:
+        return int(value in self)
 
     def _from_iterable(self, other: _Iterable, /) -> _Self:
         return self.__class__(other, key=self.__key)
 
-    def add(self, obj: T, /):
+    def add(self, value: T, /):
         """Add an element."""
-        if not self.exist(i := self.bisect(obj, False), obj):
-            self.insert(i, obj)
+        if not self.exist(i := self.bisect(value, False), value):
+            self.insert(i, value)
 
-    def discard(self, obj: T, /):
+    def discard(self, value: T, /):
         """Remove an element. Do not raise an exception if absent."""
-        if self.exist(i := self.bisect(obj, False), obj):
+        if self.exist(i := self.bisect(value, False), value):
             del self[i]
 
-    def remove(self, obj: T, /):
-        if self.exist(i := self.bisect(obj, False), obj):
+    def remove(self, value: T, /):
+        if self.exist(i := self.bisect(value, False), value):
             del self[i]
             return
-        raise KeyError(obj)
+        raise KeyError(value)
 
     @_recursive_repr()
     def __repr__(self) -> str:
@@ -658,10 +654,10 @@ class SortedSet[T](list[T], _MutableSet[T], Sorted[T]):
         if other is self:
             return self
         i = 0
-        for obj in self._get_material(other):
-            if (j := self.bisect(obj, i)) >= len(self):
+        for value in self._get_material(other):
+            if (j := self.bisect(value, i)) >= len(self):
                 break
-            if self[j] == obj:
+            if self[j] == value:
                 del self[i: j]
             i = j + 1
         del self[i:]
@@ -674,10 +670,10 @@ class SortedSet[T](list[T], _MutableSet[T], Sorted[T]):
         if other is self:
             return False
         i = 0
-        for obj in self._get_material(other):
-            if (i := self.bisect(obj, i)) >= len(self):
+        for value in self._get_material(other):
+            if (i := self.bisect(value, i)) >= len(self):
                 return True
-            if self[i] == obj:
+            if self[i] == value:
                 return False
         return True
 
@@ -685,13 +681,13 @@ class SortedSet[T](list[T], _MutableSet[T], Sorted[T]):
         if other is self:
             return self
         i = 0
-        for obj in (other := iter(self._get_material(other))):
-            if (i := self.bisect(obj, i)) >= len(self):
-                self.append(obj)
+        for value in (other := iter(self._get_material(other))):
+            if (i := self.bisect(value, i)) >= len(self):
+                self.append(value)
                 self += other
                 break
-            if self[i] != obj:
-                self.insert(i, obj)
+            if self[i] != value:
+                self.insert(i, value)
                 i += 1
         return self
 
@@ -702,10 +698,10 @@ class SortedSet[T](list[T], _MutableSet[T], Sorted[T]):
             self.clear()
             return self
         i = 0
-        for obj in self._get_material(other):
-            if (i := self.bisect(obj, i)) >= len(self):
+        for value in self._get_material(other):
+            if (i := self.bisect(value, i)) >= len(self):
                 break
-            if self[i] == obj:
+            if self[i] == value:
                 del self[i]
             else:
                 i += 1
@@ -718,15 +714,15 @@ class SortedSet[T](list[T], _MutableSet[T], Sorted[T]):
             self.clear()
             return self
         i = 0
-        for obj in (other := iter(self._get_material(other))):
-            if (i := self.bisect(obj, i)) >= len(self):
-                self.append(obj)
+        for value in (other := iter(self._get_material(other))):
+            if (i := self.bisect(value, i)) >= len(self):
+                self.append(value)
                 self += other
                 break
-            if self[i] == obj:
+            if self[i] == value:
                 del self[i]
             else:
-                self.insert(i, obj)
+                self.insert(i, value)
                 i += 1
         return self
 
@@ -842,16 +838,17 @@ class _SortedDictItemsView[KT, VT](
              map_.values()[i])
 
 
-type _IT = tuple[KT, VT]
-type _ItemsType = _Mapping[KT, VT] | _Iterable[_IT]
-
-
 class SortedDict[KT, VT](_MutableMapping[KT, VT], Sorted[KT]):
+
     """Sorted dictionary class."""
 
     __slots__ = '__key', '__keys', '__values'
 
-    def __init__(self, other: _ItemsType = (), /, *, key: _KeyType[T] = None):
+    type _IT[KT, VT] = tuple[KT, VT]
+    type _ItemsType = _Mapping[KT, VT] | _Iterable[_IT]
+
+    def __init__(self, other: _ItemsType = (), /, *,
+                 key: _KeyType[KT] = None):
         self.__key = key
 
         if isinstance(other, SortedDict):
@@ -915,18 +912,18 @@ class SortedDict[KT, VT](_MutableMapping[KT, VT], Sorted[KT]):
     def values(self) -> list[VT]:
         return self.__values
 
-    def bisect(self, obj: T, start=0, stop: int = None, /) -> int:
+    def bisect(self, value: KT, start=0, stop: int = None, /) -> int:
         """Return the index where to insert item in self."""
-        return self.keys().bisect(obj, start, stop)
+        return self.keys().bisect(value, start, stop)
 
-    def exist(self, i: int, key: T, /) -> bool:
+    def exist(self, i: int, key: KT, /) -> bool:
         """Return self.keys()[i] == key.
         Return False if index not out of range.
 
         """
         return self.keys().exist(i, key)
 
-    def index(self, key: T, start=0, stop: int = None, /) -> int:
+    def index(self, key: KT, start=0, stop: int = None, /) -> int:
         """Return the index of the key in self.keys()."""
         return self.keys().index(key, start, stop)
 
@@ -1045,19 +1042,37 @@ class Wrapper[T, WT](metaclass=_ABCMeta):
         return self.extract(obj)
 
 
-class NoWrapper[T](Wrapper[T, T]):
+class FuncWrapper[T, WT](Wrapper):
 
-    """NoWrapper class."""
+    """Wrapper made of function pair."""
 
-    __slots__ = ()
+    __slots__ = '_extract', '_expand', '_name'
 
-    extract = expand = staticmethod(lambda obj: obj)
+    def __init__(
+        self,
+        extract: _Callable[[T], WT],
+        expand: _Callable[[WT], T],
+        name=None
+    ):
+        self._extract = extract
+        self._expand = expand
+        self._name = name
 
+    def extract(self, obj: T) -> WT:
+        return self._extract(obj)
+
+    def expand(self, obj: WT) -> T:
+        return self._expand(obj)
+
+    @_recursive_repr()
     def __repr__(self) -> str:
-        return "nowrap"
+        if (name := self._name) is not None:
+            return name
+        return f"funcwrap(extract={self._extract!r}, expand={self._expand!r})"
 
 
-nowrap = NoWrapper()
+nowrap = FuncWrapper(_func := lambda obj: obj, _func, "nowrap")
+del _func
 
 
 class WrappedMapping[KT, VT, WKT, WVT](_MutableMapping[KT, VT]):
@@ -1065,6 +1080,9 @@ class WrappedMapping[KT, VT, WKT, WVT](_MutableMapping[KT, VT]):
     """WrappedMapping class."""
 
     __slots__ = 'data', 'key', 'value'
+
+    type _IT[KT, VT] = tuple[KT, VT]
+    type _ItemsType = _Mapping[KT, VT] | _Iterable[_IT]
 
     def __init__(self, data: _MutableMapping[WKT, WVT],
                  key: Wrapper[KT, WKT] = nowrap,
@@ -1079,7 +1097,7 @@ class WrappedMapping[KT, VT, WKT, WVT](_MutableMapping[KT, VT]):
     def __getitem__(self, key: KT, /) -> VT:
         return self.value.expand(self.data[self.key(key)])
 
-    def __setitem__(self, key: KT, value: VT) -> VT:
+    def __setitem__(self, key: KT, value: VT):
         self.data[self.key(key)] = self.value(value)
 
     def __delitem__(self, key: KT, /):
@@ -1095,11 +1113,12 @@ class WrappedMapping[KT, VT, WKT, WVT](_MutableMapping[KT, VT]):
         return self.value.expand(self.data.get(self.key(key), default))
 
     @_recursive_repr()
-    def __repr__(self) -> bool:
+    def __repr__(self) -> str:
         if self.value is nowrap:
-            return f"WrappedMapping(data={self.data!r}, key={self.key!r})"
-        return (f"WrappedMapping(data={self.data!r}, "
-                f"key={self.key!r}, value=self.value!r)")
+            return (f"{self.__class__.__name__}"
+                    f"(data={self.data!r}, key={self.key!r})")
+        return (f"{self.__class__.__name__}"
+                f"(data={self.data!r}, key={self.key!r}, value=self.value!r)")
 
     def __or__(self, other: _Mapping[KT, VT], /
                ) -> _Self | _NotImplementedType:
@@ -1142,6 +1161,77 @@ class WrappedMapping[KT, VT, WKT, WVT](_MutableMapping[KT, VT]):
         """Return a shallow copy of self."""
         return self.__class__(
             _copy(self.data), self.key, self.value)
+
+    __copy__ = copy
+
+
+class WrappedSequence[T, WT](_MutableSequence[WT]):
+
+    """WrappedSequence class."""
+
+    __slots__ = 'data', 'wrapper'
+
+    def __init__(self, data: _MutableSequence[WT],
+                 wrapper: Wrapper[T, WT] = nowrap):
+        self.data = data
+        self.wrapper = wrapper
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, i: int, /) -> T:
+        return self.wrapper.expand(self.data[i])
+
+    def __setitem__(self, i: int, value: T):
+        self.data[i] = self.wrapper(value)
+
+    def __delitem__(self, i: int, /):
+        del self.data[i]
+
+    def insert(self, i: int, value: T, /):
+        self.data.insert(i, self.wrapper(value))
+
+    def append(self, value: T, /):
+        self.data.append(self.wrapper(value))
+
+    def clear(self):
+        self.data.clear()
+
+    def reverse(self):
+        self.data.reverse()
+
+    def extend(self, values: _Iterable[T], /):
+        self.data.extend(map(self.wrapper, values))
+
+    def pop(self, i=-1, /) -> T:
+        return self.data.pop(i)
+
+    def remove(self, value: T, /):
+        return self.data.remove(value)
+
+    def __iter__(self) -> _Iterable[T]:
+        return map(self.wrapper.expand, self.data)
+
+    def __contains__(self, value: T, /) -> bool:
+        return self.wrapper(value) in self.data
+
+    def __reversed__(self):
+        return map(self.wrapper.expand, reversed(self.data))
+
+    def index(self, value: T, start=0, stop: int = None, /) -> int:
+        return self.data.index(self.wrapper(value), start, stop)
+
+    def count(self, value: T) -> int:
+        return self.data.count(self.wrapper(value))
+
+    @_recursive_repr()
+    def __repr__(self) -> str:
+        return (f"{self.__class__.__name__}"
+                f"(data={self.data!r}, wrapper={self.wrapper!r})")
+
+    def copy(self) -> _Self:
+        """Return a shallow copy of self."""
+        return self.__class__(_copy(self.data), self.wrapper)
 
     __copy__ = copy
 

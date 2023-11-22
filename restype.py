@@ -20,14 +20,11 @@ from .basemodule import Bounded, DataBased
 from .session import Session
 from .session import Sync, concat_varname, get_servfunc
 from .session import Fillers, Syncable, SyncFiller
-from .utils import Wrapper, WrappedMapping
+from .utils import FuncWrapper, WrappedMapping
 
 from .ilfocore.constants import BYTEORDER
 from .ilfocore.utils import pack_with_size, read_by_size, write_with_size
 
-
-# IDE
-T = None
 
 ENCODING = 'utf-8'
 
@@ -42,20 +39,7 @@ def decode(data: bytes) -> str:
     return str(data, ENCODING)
 
 
-class DecodingWrapper(Wrapper):
-
-    """Bytes to string."""
-
-    __slots__ = ()
-
-    extract = decode
-    expand = encode
-
-    def __repr__(self) -> str:
-        return 'decodewrap'
-
-
-decodewrap = DecodingWrapper()
+decodewrap = FuncWrapper[bytes, str](decode, encode, "decodewrap")
 
 
 class _IOSerializable(ABC):
@@ -83,7 +67,12 @@ class Serializable(_IOSerializable, Syncable):
 
     @abstractmethod
     def to_bytes(self) -> bytes:
-        """Convert to bytes."""
+        """Convert all data to bytes."""
+
+    @property
+    def rdig(self) -> bytes:
+        """Digested bytes."""
+        return self.to_bytes()
 
     @property
     @abstractmethod
@@ -93,38 +82,19 @@ class Serializable(_IOSerializable, Syncable):
     def __eq__(self, other) -> bool:
         return (self is other
                 or isinstance(other, Serializable)
-                and self.rtype == other.rtype
-                and self.to_bytes() == other.to_bytes())
+                and self.rtype == other.rtype and self.rdig == other.rdig)
 
     def __hash__(self) -> int:
-        return hash((self.rtype, self.to_bytes()))
+        return hash((self.rtype, self.rdig))
 
     def __str__(self) -> str:
-        return self.to_bytes().hex()
+        return self.rdig.hex()
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__} {self}>"
 
     def __index__(self) -> int:
-        return int.from_bytes(self.to_bytes(), BYTEORDER)
-
-
-class WithMsg[T: Serializable](Serializable):
-
-    """Serializable object with an inner message."""
-
-    __slots__ = ()
-
-    def to_fillers(self, fillers: Fillers):
-        msg = self.msg
-        msg.rtype.to_fillers(fillers)
-        msg.to_fillers(fillers)
-
-    def to_bytes(self) -> bytes:
-        msg = self.msg
-        return pack_with_size(msg.rtype.to_bytes()) + msg.to_bytes()
-
-    @property
-    @abstractmethod
-    def msg(self) -> T:
-        """Inner serializable message."""
+        return int.from_bytes(self.rdig, BYTEORDER)
 
 
 class Resource(Serializable):
@@ -135,13 +105,13 @@ class Resource(Serializable):
 
     def __eq__(self, other) -> bool:
         return (self is other
-                or self.rtype == other.rtype and self._rid == other._rid)
+                or self.rtype == other.rtype and self.rid == other.rid)
 
     def __hash__(self) -> int:
-        return hash((self.rtype, self._rid))
+        return hash((self.rtype, self.rid))
 
     def __repr__(self) -> str:
-        return f"<{self.__class__.__name__} id={self._rid}>"
+        return f"<{self.__class__.__name__} {self.rid}>"
 
     @property
     @abstractmethod
@@ -149,7 +119,7 @@ class Resource(Serializable):
         """Resource ID."""
 
 
-class TypedMapping[T: Serializable](ABC):
+class TypedMapping(ABC):
 
     """Typed resources mapping."""
 
@@ -159,19 +129,24 @@ class TypedMapping[T: Serializable](ABC):
         return isinstance(res, Serializable) and res.rtype == self.rtype
 
     def __len__(self):
-        return len(self.bytes)
+        return len(self.rdig)
 
     def __iter__(self):
-        yield from self.bytes.values()
+        yield from self.rdig.values()
 
-    def read(self, con: Session, buf: BufferedReader) -> T:
+    def read(self, con: Session, buf: BufferedReader) -> Serializable:
         """Read resource from received buffer."""
         return self.bytes[read_by_size(buf)]
 
     @property
     @abstractmethod
-    def bytes(self) -> Mapping[bytes, T]:
+    def bytes(self) -> Mapping[bytes, Serializable]:
         """Mapping using serialized bytes as key."""
+
+    @property
+    def rdig(self) -> Mapping[bytes, Serializable]:
+        """Mapping using digested bytes as key."""
+        return self.bytes
 
     @property
     @abstractmethod
@@ -231,6 +206,32 @@ class ResType(Resource, Bounded):
         return self._mod
 
 
+class WithMsg[T: Serializable](Serializable):
+
+    """Serializable object with an inner message."""
+
+    __slots__ = ()
+
+    def to_fillers(self, fillers: Fillers):
+        msg = self.msg
+        msg.rtype.to_fillers(fillers)
+        msg.to_fillers(fillers)
+
+    def to_bytes(self) -> bytes:
+        msg = self.msg
+        return pack_with_size(msg.rtype.to_bytes()) + msg.to_bytes()
+
+    @property
+    def rdig(self) -> bytes:
+        msg = self.msg
+        return pack_with_size(msg.rtype.rdig) + msg.rdig
+
+    @property
+    @abstractmethod
+    def msg(self) -> T:
+        """Inner serializable message."""
+
+
 class RTypeMapping(TypedMapping[ResType], Bounded):
 
     """Type mapping."""
@@ -256,7 +257,7 @@ class RTypeMapping(TypedMapping[ResType], Bounded):
         self._id_map[type_.rid] = type_
         self._str_map[str(type_)] = type_
 
-    def read(self, con: Session, buf: BufferedReader) -> T:
+    def read(self, con: Session, buf: BufferedReader) -> ResType:
         """Read resource from received buffer."""
         return con.syncs[self._mod, 'type'].read(buf)
 
