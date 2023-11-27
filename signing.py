@@ -30,7 +30,7 @@ from .ilfocore.utils import (
     write_with_size
 )
 
-from .basemodule import Bounded, DataBased
+from .basemodule import Bound, DataBased
 from .session import Session
 from .session import Sync, concat_varname, get_servfunc
 from .session import Fillers, SyncFiller
@@ -43,7 +43,7 @@ from .utils import Inner
 from .utils import FuncWrapper, Wrapper, WrappedMapping
 
 
-class Signer(Resource, Bounded):
+class Signer(Resource, Bound):
 
     __slots__ = '_id', '_mod', '_pub', '_priv'
 
@@ -97,9 +97,9 @@ class Signer(Resource, Bounded):
         return self._pub.to_bytes()
 
     @property
-    def rtype(self) -> ResType:
+    def rtype(self) -> ResType['Signer']:
         """.signer"""
-        return self._mod.type_signer
+        return self._mod.restype_manager.mapping.str['.signer']
 
     @property
     def module(self) -> 'SigningManager':
@@ -109,7 +109,7 @@ class Signer(Resource, Bounded):
 type KeyLike = bytes | PublicKey | tuple[str, bytes]
 
 
-class SignerMapping(TypedMapping[Signer], Bounded):
+class SignerMapping(TypedMapping[Signer], Bound):
 
     """Signer mapping."""
 
@@ -185,16 +185,16 @@ class SignerMapping(TypedMapping[Signer], Bounded):
         return con.syncs[self._mod, 'signer'].read(buf)
 
     @property
-    def rtype(self) -> ResType:
+    def rtype(self) -> ResType[Signer]:
         """.signer"""
-        return self._mod.type_signer
+        return self._mod.restype_manager.mapping.str['.signer']
 
     @property
     def module(self) -> 'SigningManager':
         return self._mod
 
 
-class Signature[T: Resource](WithMsg[T], Resource, Bounded):
+class Signature[T: Resource](WithMsg[T], Resource, Bound):
 
     """Signature class."""
 
@@ -213,10 +213,9 @@ class Signature[T: Resource](WithMsg[T], Resource, Bounded):
                  id_, int, sig: bytes, signer_id: int,
                  res_type_id: int, res_id: int) -> Self:
         """Construt from row."""
-        signer = mod.type_signer.mapping.rid[signer_id]
-        res_type = mod.restype_manager.type.mapping.rid[res_type_id]
-        res = res_type.mapping.rid[res_id]
-        return cls(mod, id_, sig, signer, res)
+        signer = mod.mapping_signer.rid[signer_id]
+        msg = mod.restype_manager.mapping.rid[res_type_id].mapping.rid[res_id]
+        return cls(mod, id_, sig, signer, msg)
 
     class Material(InnerRes['Signature']):
 
@@ -258,9 +257,9 @@ class Signature[T: Resource](WithMsg[T], Resource, Bounded):
         return self._sig
 
     @property
-    def rtype(self) -> ResType:
+    def rtype(self) -> ResType['Signature']:
         """.sig"""
-        return self._mod.type_sig
+        return self._mod.restype_manager.mapping.str['.sig']
 
     @property
     def module(self) -> 'SigningManager':
@@ -270,7 +269,7 @@ class Signature[T: Resource](WithMsg[T], Resource, Bounded):
 type SigParams = tuple[bytes, Signer, Resource]
 
 
-class SignatureMapping(TypedMapping[Signer], Bounded):
+class SignatureMapping(TypedMapping[Signer], Bound):
 
     """Signature mapping."""
 
@@ -299,8 +298,8 @@ class SignatureMapping(TypedMapping[Signer], Bounded):
 
         def __iter__(self) -> Iterable[SigParams]:
             mod = self._outer.module
-            signer_id_map = mod.type_signer.mapping.rid
-            type_id_map = mod.restype_manager.type.mapping.rid
+            signer_id_map = mod.mapping_signer.rid
+            type_id_map = mod.restype_manager.mapping.rid
             for sig_bytes, signer_id, type_id, msg_id in mod.sql_conn.execute(
                     "SELECT sig, signer, mtype, msg FROM signature"):
                 signer = signer_id_map[signer_id]
@@ -369,7 +368,7 @@ class SignatureMapping(TypedMapping[Signer], Bounded):
             sig_bytes = read_by_size(buf := BytesIO(data))
             signer = read_by_size(buf, not_none=False)
             msg = (None if signer is None else
-                   self._outer.module.restype_manager.type
+                   self._outer.module.restype_manager
                    .mapping.bytes[read_by_size(buf)]
                    .mapping.bytes[buf.read()])
             return sig_bytes, signer, msg
@@ -391,24 +390,24 @@ class SignatureMapping(TypedMapping[Signer], Bounded):
 
     def read(self, con: Session, buf: BufferedReader) -> Signature:
         mod = self._mod
-        return self.sig[
-            read_by_size(buf),
-            mod.type_signer.mapping.read(buf),
-            mod.restype_manager.type.mapping.read(buf).mapping.read(buf)
-        ]
+        sig_bytes = read_by_size(buf)
+        signer = mod.mapping_signer.read(buf, not_none=False)
+        msg = (None if signer is None else
+               mod.restype_manager.mapping.read(buf).mapping.read(buf))
+        return self.sig[sig_bytes, signer, msg]
 
     @property
-    def bytes(self):
-        pass
+    def bytes(self) -> WrappedMapping[bytes, Signature, SigParams, Signature]:
+        return WrappedMapping(self.sig, self.byteswrap)
 
     @property
     def rdig(self) -> WrappedMapping[bytes, Signature, SigParams, Signature]:
         return WrappedMapping(self.sig, self.sigbyteswrap)
 
     @property
-    def rtype(self) -> 'ResType':
+    def rtype(self) -> ResType[Signature]:
         """.sig"""
-        return self._mod.type_sig
+        return self._mod.restype_manager.mapping.str['.sig']
 
     @property
     def module(self) -> 'SigningManager':
@@ -423,16 +422,17 @@ class SigningManager(DataBased):
 
     def __init__(self):
         super().__init__()
-        self._type_signer: ResType = None
-        self._type_sig: ResType = None
+        self._maps_signer = SignerMapping(self)
+        self._maps_sig = SignatureMapping(self)
         self._lock = RLock()
 
     def load_data(self, conn):
         """Load data from database."""
         super().__init__(conn)
         self._rtyper = rtyper = self._account.modules[ResTypeManager.name]
-        self._type_signer = type_ = rtyper.type.mapping.str['.signer']
-        type_.mapping = mapping = SignerMapping(self)
+        str_types = rtyper.mapping
+        str_types['.sig'].mapping = self._maps_sig
+        str_types['.signer'].mapping = signers = self._maps_signer
         with conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS signer(
@@ -464,39 +464,29 @@ class SigningManager(DataBased):
                 else:
                     priv_key = get_sign(alg).from_bytes(priv_bytes, pub_bytes)
                     pub_key = priv_key.public_key
-                mapping.key[pub_bytes] = Signer(self, id_, pub_key, priv_key)
+                signers.key[pub_bytes] = Signer(self, id_, pub_key, priv_key)
 
     def start(self):
         """Account starts."""
+        account = self._account
+        load = account.load_service
         name = self.name
-        load = self._account.load_service
-        load(name + '.alg', get_servfunc(concat_varname(self, 'alg_sync')))
-        load(name, get_servfunc(concat_varname(self, 'key_sync')))
-        load(name + '.sig', self._serv_sig)
-        self._type_signer.mapping.key[self._account.node.sig_key]
+        load(name + '.signersync',
+             get_servfunc(concat_varname(self, 'signer')))
+        load(name + '.sigsync', self._serv_sig)
+        self._maps_signer.key[account.node.sig_key]
         logging.debug("module singer started")
 
     def setup_session(self, con):
         """Session starts."""
         super().setup_session(con)
-        name = self.name
-        servs = self._account.services
-        serv_sig = servs[name + '.sig']
-        serv_signer = servs[name + '.signer']
-        con.synchronize_service(serv_sig, serv_signer)
         con.syncs[self, 'signer'] = Sync(
-            con, serv_signer, self._ser_signer, self._deser_signer)
-
-    def close(self):
-        """Close the module."""
-        super().close()
-        self._type_signer = None
-        self._type_sig = None
+            con, self._ser_signer, self._deser_signer)
 
     def _serv_sig(self, con, buf):
         """Handle received signatures."""
         try:
-            self._type_sig.read(con, buf)
+            self._maps_sig.read(con, buf)
         except ValueError:
             buf.read()
             return
@@ -516,9 +506,9 @@ class SigningManager(DataBased):
         return (write_with_size(bytes(pub_key.name, ENCODING), buf)
                 + write_with_size(pub_key.to_bytes(), buf))
 
-    def _deser_key(self, buf: BufferedReader) -> Signer | None:
+    def _deser_key(self, buf: BufferedReader) -> Signer:
         """Deserialize a public key from buffer."""
-        return self._type_signer.mapping.key[
+        return self._maps_signer.key[
             str(read_by_size(buf), ENCODING), read_by_size(buf)]
 
     def sync_signer(self, con: Session, *signers: Signer):
@@ -531,23 +521,23 @@ class SigningManager(DataBased):
 
     def sign(self, signer: Signer, res: Resource) -> Signature:
         """Create a signature of the resource."""
-        return self._type_sig.mapping.sig[None, signer, res]
+        return self._maps_sig.sig[None, signer, res]
 
     def verify(self, sig_bytes: bytes, signer: Signer, res: Resource):
         """Verify a signature of the resource."""
-        return self._type_sig.mapping.sig[sig_bytes, signer, res]
+        return self._maps_sig.sig[sig_bytes, signer, res]
 
     @property
-    def type_signer(self) -> ResType:
+    def mapping_signer(self) -> SignerMapping:
         """.signer"""
-        return self._type_signer
+        return self._maps_signer
 
     @property
-    def type_sig(self) -> ResType:
+    def mapping_sig(self) -> SignatureMapping:
         """.sig"""
-        return self._type_sig
+        return self._maps_sig
 
     @property
     def restype_manager(self) -> ResTypeManager:
-        """RTypeMapping instance bounded."""
+        """RTypeMapping instance bound."""
         return self._rtyper

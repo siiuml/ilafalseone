@@ -12,14 +12,15 @@ Ilafalseone session.
 import logging
 import traceback
 from abc import ABC, abstractmethod
-from collections import OrderedDict, deque
-from collections.abc import Callable, Hashable, MutableSequence
+from collections import OrderedDict, UserDict, UserList, deque
+from collections.abc import Callable, MutableSequence
 from io import BufferedIOBase, BufferedReader, BytesIO
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING
 
 from .ilfocore.constants import ENCODING
 from .ilfocore.ilfonode import BaseSession
 from .ilfocore.utils import (
+    NULL,
     read_by_size,
     read_integral,
     write_integral,
@@ -29,8 +30,106 @@ from .ilfocore.utils import (
 from .utils import OrderedList
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
     from .basemodule import Module
 
+
+class SendDict[T: Hashable](UserDict[T, int]):
+
+    """Sending dictionary in synchronization."""
+
+    def __init__(self, maxlen=128, lru=False):
+        self._data: dict[T, int] = OrderedDict() if lru else {}
+        self._maxlen = maxlen
+
+    def popitem(self) -> tuple[T, int]:
+        if isinstance(data := self._data, OrderedDict):
+            return data.popitem(False)
+        key = next(iter(data))
+        return key, data.pop(key)
+
+    def get(self, key: T, default=None) -> int:
+        return self._data.get(T, default)
+
+    def __getitem__(self, key: T) -> int:
+        if (i := self.get(key)) is not None:
+            return i
+        if (i := len(self)) >= self.maxlen:
+            _, i = self.popitem(False)
+        self[key] = i
+        return i
+
+    @property
+    def data(self) -> dict[T, int]:
+        """Inner collection."""
+        return self._data
+
+    @property
+    def maxlen(self) -> int:
+        """Maximum length."""
+        return self._maxlen
+
+
+class RecvList[T: Hashable](UserList[T]):
+
+    """Receiving list in synchronization."""
+
+    def __init__(self, maxlen=128, lru=False):
+        if lru:
+            self._data = OrderedList[T]()
+        else:
+            self._data: list[T] = []
+            self._popidx = 0
+        self._maxlen = maxlen
+
+    def move_to_end(self, i: T):
+        """Move an existing element to the end."""
+        if isinstance(data := self._data, OrderedList):
+            data.move_to_end(i)
+
+    def add(self, obj: T) -> int:
+        """Add an object to recvlist."""
+        if (i := len(data := self.data)) < self._maxlen:
+            data.append(obj)
+        else:
+            if isinstance(data, OrderedList):
+                data.move_to_end(i := next(iter(data.keys())))
+            else:
+                i = self._popidx
+                self._popidx += 1
+            data[i] = obj
+        return i
+
+    @property
+    def data(self) -> dict[T, int]:
+        """Inner collection."""
+        return self._data
+
+    @property
+    def maxlen(self) -> int:
+        """Maximum length."""
+        return self._maxlen
+
+    @property
+    def popindex(self) -> int:
+        """The index of the object to pop next."""
+        if isinstance(data := self.data, OrderedList):
+            return next(iter(data.keys()))
+        return self._popidx
+
+
+class Unreadable:
+
+    """Unreadble class."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return 'Unreadble'
+
+
+unreadble = Unreadable()
+SYNC_MARK = b'\xfe'
 
 type Serialization[T] = Callable[[T, BufferedIOBase], int]
 type Deserialization[T] = Callable[[BufferedIOBase], T | None]
@@ -42,62 +141,76 @@ class Sync[T: Hashable]:
 
     __slots__ = '_con', '_serv', '_senddict', '_recvlist', '_ser', '_deser'
 
-    def __init__(self, con: 'Session', serv: 'Service',
-                 serialization: Serialization[T] = None,
-                 deserialization: Deserialization[T] = None):
+    def __init__(self, con: 'Session',
+                 serialization: Serialization[T] = write_with_size,
+                 deserialization: Deserialization[T] = read_by_size,
+                 senddict: SendDict[T] = None, recvlist: RecvList[T] = None,
+                 sync_mark: bytes | None = None):
         self._con = con
-        self._serv = serv
-        self._senddict: dict[T, int] = {}
-        self._recvlist: list[T] = []
         self._ser = serialization
         self._deser = deserialization
+        self._senddict = SendDict[T]() if senddict is None else senddict
+        self._recvlist = RecvList[T]() if recvlist is None else recvlist
+        self._sync_mark = sync_mark
 
-    def send(self, obj: T | None, buf: BufferedIOBase) -> int:
-        """Write synchronizations of new objects into buffer.
+    def send(self, obj: T, buf: BufferedIOBase) -> int:
+        """Write a new object into buffer for synchronization.
 
         Returns the number of bytes written.
 
         """
-        if obj is None:
-            return 0
-        send[obj] = len(send := self._senddict)
-        if (ser := self._ser) is None:
-            return write_with_size(obj, buf)
-        return ser(obj, buf)
+        self._senddict[obj]
+        return self._ser(obj, buf)
 
     def recv(self, buf: BufferedReader) -> T:
-        """Read a synchronization of a new object from buffer."""
-        self._recvlist.append(
-            obj := read_by_size(buf)
-            if (deser := self._deser) is None else deser(buf))
+        """Read a new object from buffer with synchronization."""
+        self._recvlist.add(obj := self._deser(buf))
         return obj
 
-    def write(self, obj: T | None, buf: BufferedIOBase) -> int:
+    def write(self, obj: T, buf: BufferedIOBase) -> int:
         """Write a synchronized object into buffer.
 
         Returns the number of bytes written.
 
         """
-        if obj is None:
-            return buf.write(b'\xff')
-        return write_integral(self._senddict[obj], buf)
+        i = self._senddict.get(obj)
+        if (mark := self._sync_mark) is not None:
+            if i is None:
+                return self.send(obj, buf)
 
-    def read(self, buf: BufferedIOBase, *, not_none=True) -> T | None:
+            return buf.write(mark) + write_integral(i, buf)
+
+        if i is None:
+            return buf.write(NULL) + self.send(obj, buf)
+
+        return write_integral(i, buf)
+
+    def read(self, buf: BufferedIOBase) -> T:
         """Get a synchronized object from buffer."""
-        if (i := read_integral(buf, not_none)) is None:
-            return None
-        if (i < len(recvlist := self._recvlist)
-                and (obj := recvlist[i]) is not None):
+        recvlist = self._recvlist
+        if (mark := self._sync_mark) is not None:
+            pos = buf.tell()
+            if buf.read(len(mark)) != mark:
+                buf.seek(pos)
+                return self.recv(buf)
+
+        elif (i := read_integral(buf, not_none=False)) is None:
+            return self.recv(buf)
+
+        if ((i := read_integral(buf)) < len(recvlist)
+                and (obj := recvlist[i]) is not unreadble):
+            recvlist.move_to_end(i)
             return obj
-        raise ValueError("Read an unknown object")
+
+        raise ValueError(f"Read an unreadable object {i}")
 
     @property
-    def senddict(self) -> dict[T, int]:
+    def senddict(self) -> SendDict[T]:
         """Return the objects sent."""
         return self._senddict
 
     @property
-    def recvlist(self) -> list[T]:
+    def recvlist(self) -> RecvList[T]:
         """Return the objects received."""
         return self._recvlist
 
@@ -106,115 +219,15 @@ class Sync[T: Hashable]:
         """Bounding session."""
         return self._con
 
-    @property
-    def service(self):
-        """Service to send synchronization."""
-        return self._serv
-
 
 def ser_str(str_: str, buf: BufferedIOBase) -> int:
     """Serialize a data type into buffer."""
     return write_with_size(bytes(str_, ENCODING), buf)
 
 
-def deser_str(buf: BufferedReader) -> str | None:
+def deser_str(buf: BufferedReader) -> str:
     """Deserialize a string from buffer."""
     return str(read_by_size(buf), ENCODING)
-
-
-class DynamicSync[T: Hashable](Sync[T]):
-
-    """Dynamic synchronized factors in sessions."""
-
-    __slots__ = '_senddict_rem', '_recvlist_rem'
-
-    def __init__(self, con: 'Session',
-                 serialization: Serialization[T] = None,
-                 deserialization: Deserialization[T] = None,
-                 send_maxlen: int = 128, recv_maxlen: int = 128):
-        super().__init__(con, None, serialization, deserialization)
-        self._senddict: OrderedDict[T, int] = OrderedDict(self._senddict)
-        self._recvlist: OrderedList[T] = OrderedList(self._recvlist)
-        self._senddict_rem = send_maxlen
-        self._recvlist_rem = recv_maxlen
-
-    def write(self, obj: T | None, buf: BufferedIOBase) -> int:
-        """Write a synchronized object into buffer.
-
-        Returns the number of bytes written.
-
-        """
-        if obj is None:
-            return buf.write(b'\xff')
-        if (i := (senddict := self._senddict).get(obj)) is None:
-            self.add_to_senddict(obj)
-            if (ser := self._ser) is None:
-                return write_with_size(obj, buf)
-            return ser(obj)
-        senddict.move_to_end(obj)
-        return write_integral(i, buf)
-
-    def read(self, buf: BufferedIOBase, *, not_none=True) -> T | None:
-        """Get a synchronized object from buffer."""
-        if (size := read_integral(buf, not_none)) is None:
-            return None
-        if size:
-            self.add_to_recvlist(obj := (
-                buf.read(size)
-                if (deser := self._deser) is None else deser(buf)
-            ))
-            return obj
-        if (i := read_integral(buf, not_none)) is None:
-            return None
-        if (i < len(recvlist := self._recvlist)
-                and (obj := recvlist[i]) is not None):
-            recvlist.move_to_end(i)
-            return obj
-        raise ValueError
-
-    def add_to_senddict(self, obj: T) -> int:
-        """Add an object to self.senddict.
-
-        Return the object index.
-
-        """
-        senddict = self._senddict
-        if self._senddict_rem:
-            self._senddict_rem -= 1
-            i = len(self._senddict)
-        else:
-            _, i = senddict.popitem(False)
-        senddict[obj] = i
-        return i
-
-    def add_to_recvlist(self, obj: T) -> int:
-        """Add an object to self.recvlist.
-
-        Return the object index.
-
-        """
-        recvlist = self._recvlist
-        if self._recvlist_rem:
-            self._recvlist_rem -= 1
-            i = len(recvlist)
-            recvlist.append(obj)
-        else:
-            recvlist[i := next(iter(recvlist.keys()))] = obj
-            recvlist.move_to_end(i)
-        return i
-
-    @property
-    def senddict_remaining(self) -> int:
-        """Return the size available for new objects in self.senddict."""
-        return self._senddict_rem
-
-    @property
-    def recvlist_remaining(self) -> int:
-        """Return the size available for new objects in self.recvlist."""
-        return self._recvlist_rem
-
-    senddict: OrderedDict
-    recvlist: OrderedList
 
 
 type ServiceFunction = Callable[['Session', BufferedReader], None]
@@ -256,8 +269,8 @@ class Service:
         return self._func
 
 
-def concat_varname(cls: Union[str, type, 'Module'], name: str) -> str:
-    """Get full key name in var(con := Session())."""
+def concat_varname(cls: 'str | type | Module', name: str) -> str:
+    """Get full key name in session dictionaries like vars(con)."""
     if isinstance(cls, str):
         pass
     elif isinstance(cls, type):
@@ -267,7 +280,7 @@ def concat_varname(cls: Union[str, type, 'Module'], name: str) -> str:
     return cls + '_' + name
 
 
-type _VarNameType = str | tuple[Union[str, type, 'Module'], str]
+type _VarNameType = str | tuple['str | type | Module', str]
 
 
 def get_servfunc(key: _VarNameType) -> ServiceFunction:
@@ -282,7 +295,7 @@ def get_servfunc(key: _VarNameType) -> ServiceFunction:
     return serv_func
 
 
-class _VarsDict[T: Any](dict[_VarNameType, T]):
+class _VarsDict[T](dict[_VarNameType, T]):
 
     _marker = object()
 
@@ -295,7 +308,7 @@ class _VarsDict[T: Any](dict[_VarNameType, T]):
     def __getitem__(self, key: _VarNameType, /) -> T:
         return super().__getitem__(self._get_str_key(key))
 
-    def get(self, key: _VarNameType, default: Any = None, /) -> T:
+    def get(self, key: _VarNameType, default=None, /) -> T:
         return super().get(self._get_str_key(key), default)
 
     def __setitem___(self, key: _VarNameType, value: T, /):
@@ -304,20 +317,20 @@ class _VarsDict[T: Any](dict[_VarNameType, T]):
     def __delitem__(self, key: _VarNameType, /):
         super().__setitem__(self._get_str_key(key))
 
-    def __contains__(self, obj: Any, /) -> bool:
+    def __contains__(self, obj, /) -> bool:
         try:
             obj = self._get_str_key(obj)
         except (AttributeError, TypeError, ValueError):
             return False
         return super().__contains__(obj)
 
-    def pop(self, key: _VarNameType, default: Any = _marker, /) -> T:
+    def pop(self, key: _VarNameType, default=_marker, /) -> T:
         value = super().pop(key, default)
         if value is not self._marker:
             return value
         raise KeyError(key)
 
-    def setdefault(self, key: _VarNameType, default: Any = None, /) -> T:
+    def setdefault(self, key: _VarNameType, default=None, /) -> T:
         return super().setdefault(self._get_str_key(key), default)
 
 
@@ -331,10 +344,12 @@ class Filler(ABC):
     def fill(self, con: 'Session', buf: BytesIO) -> int:
         """Fill into buffer."""
 
+    __call__ = fill
 
-class DSyncFiller[T: Hashable](Filler):
 
-    """Dynamically synchronizing filler."""
+class SyncFiller[T: Hashable](Filler):
+
+    """Synchronizing filler."""
 
     __slots__ = '_name', '_obj'
 
@@ -355,27 +370,6 @@ class DSyncFiller[T: Hashable](Filler):
     def obj(self) -> T:
         """The object to be synchorized."""
         return self._obj
-
-
-class SyncFiller[T: Hashable](DSyncFiller[T]):
-
-    """Synchronizing filler."""
-
-    __slots__ = ()
-
-    def fill(self, con: 'Session', buf: BytesIO) -> int:
-        """Write the object to be synchorized."""
-        if (obj := self._obj) is None:
-            return write_with_size(None, buf)
-
-        sync: Sync[T] = con.syncs[sync_name := self._name]
-        if obj not in sync.sendmap:
-            prep = con.preparing
-            if (sync_buf := prep.get(serv := sync.service)) is None:
-                con.service_sync.write(serv, sync_buf := BytesIO())
-                prep[str(serv)] = sync_buf
-            sync.send(obj, sync_buf)
-        return con.syncs[sync_name].write(obj, buf)
 
 
 type Fillers = MutableSequence[bytes | Filler]
@@ -401,23 +395,19 @@ class Session(BaseSession):
         self.__mods = account.modules.values()
         self.__mods_lock = account.modules_lock
         self.__servs = servs = account.services
-        self.__serv = serv = servs['.servsync']
+        self.__serv = servs['.servsync']
 
-        self._serv_sync = sync = Sync(
-            self, serv, self._ser_serv, self._deser_serv)
+        self._serv_sync = sync = Sync(self, self._ser_serv, self._deser_serv)
         self._syncs = syncs = _VarsDict[Sync]()
         syncs[self, 'serv'] = sync
 
         self._seqs_to_ack: deque[tuple[int, 'Module']] = deque()
         self._preparing: dict[str, BytesIO] = {}
-        self._dict = _VarsDict[Any]()
+        self._dict = _VarsDict()
 
     def setup_common(self):
         """Setup the session."""
         self.handle = self.handle_common
-        send = self._serv_sync.senddict
-        send[serv := self.__servs['.servsync']] = len(send)
-        self._serv_sync.recvlist.append(serv)
         with self.__mods_lock:
             for mod in self.__mods:
                 mod.setup_session(self)
@@ -463,13 +453,13 @@ class Session(BaseSession):
             self.close()
 
     @staticmethod
-    def _ser_serv(serv: Service, buf: BufferedIOBase):
+    def _ser_serv(serv: Service, buf: BufferedIOBase) -> int:
         """Serialize a service into buffer."""
-        write_with_size(bytes(serv.name, ENCODING), buf)
+        return ser_str(serv.name, buf)
 
-    def _deser_serv(self, buf: BufferedIOBase) -> Service | None:
+    def _deser_serv(self, buf: BufferedIOBase) -> Service:
         """Deserialize a service from buffer."""
-        return self.__servs.get(str(read_by_size(buf), ENCODING))
+        return self.__servs.get(deser_str(buf), unreadble)
 
     def sync_service(self, *services: Service):
         """Synchronize services to target."""
@@ -503,7 +493,7 @@ class Session(BaseSession):
     @property
     def syncs(self) -> _VarsDict[Sync]:
         """Session synchronizations."""
-        return self._sync
+        return self._syncs
 
     @property
     def preparing(self) -> dict[str, BytesIO]:
@@ -511,6 +501,6 @@ class Session(BaseSession):
         return self._preparing
 
     @property
-    def __dict__(self) -> _VarsDict[Any]:
-        """Variables bounded to the session."""
+    def __dict__(self) -> _VarsDict:
+        """Variables binding to the session."""
         return self._dict

@@ -148,16 +148,16 @@ class Module(ABC):
         return f"module {self.name}"
 
 
-class Bounded[T: Module](ABC):
+class Bound[T: Module](ABC):
 
-    """Object bounded with a module."""
+    """Object binding a module."""
 
     __slots__ = ()
 
     @property
     @abstractmethod
     def module(self) -> T:
-        """The Module which object bounded with."""
+        """The Module which object binding to."""
 
 
 class DataBased(Module):

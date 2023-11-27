@@ -12,11 +12,11 @@ Resource type manager.
 import logging
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from io import BufferedIOBase, BufferedReader, BytesIO
 from threading import RLock
 
-from .basemodule import Bounded, DataBased
+from .basemodule import Bound, DataBased
 from .session import Session
 from .session import Sync, concat_varname, get_servfunc
 from .session import Fillers, Syncable, SyncFiller
@@ -119,42 +119,42 @@ class Resource(Serializable):
         """Resource ID."""
 
 
-class TypedMapping(ABC):
+class TypedMapping[T: Serializable](ABC):
 
     """Typed resources mapping."""
 
     __slots__ = ()
 
-    def __contains__(self, res):
+    def __contains__(self, res: T):
         return isinstance(res, Serializable) and res.rtype == self.rtype
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.rdig)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[T]:
         yield from self.rdig.values()
 
-    def read(self, con: Session, buf: BufferedReader) -> Serializable:
+    def read(self, con: Session, buf: BufferedReader) -> T:
         """Read resource from received buffer."""
         return self.bytes[read_by_size(buf)]
 
     @property
     @abstractmethod
-    def bytes(self) -> Mapping[bytes, Serializable]:
+    def bytes(self) -> Mapping[bytes, T]:
         """Mapping using serialized bytes as key."""
 
     @property
-    def rdig(self) -> Mapping[bytes, Serializable]:
+    def rdig(self) -> Mapping[bytes, T]:
         """Mapping using digested bytes as key."""
         return self.bytes
 
     @property
     @abstractmethod
-    def rtype(self) -> 'ResType':
+    def rtype(self) -> 'ResType[T]':
         """Resource type of the keys in mapping."""
 
 
-class ResType(Resource, Bounded):
+class ResType[T: Serializable](Resource, Bound):
 
     """Resource type class."""
 
@@ -183,17 +183,17 @@ class ResType(Resource, Bounded):
         return hash(str(self))
 
     @property
-    def mapping(self) -> 'TypedMapping':
+    def mapping(self) -> TypedMapping[T]:
         """Mapping."""
         return self._mapping
 
     @mapping.setter
-    def mapping(self, mapping: 'TypedMapping'):
+    def mapping(self, mapping: TypedMapping[T]):
         """Set maps."""
         self._mapping = mapping
 
     @property
-    def rtype(self) -> 'ResType':
+    def rtype(self) -> 'ResType[ResType]':
         """.type"""
         return self._mod.type
 
@@ -232,7 +232,7 @@ class WithMsg[T: Serializable](Serializable):
         """Inner serializable message."""
 
 
-class RTypeMapping(TypedMapping[ResType], Bounded):
+class RTypeMapping(TypedMapping[ResType], Bound):
 
     """Type mapping."""
 
@@ -276,7 +276,7 @@ class RTypeMapping(TypedMapping[ResType], Bounded):
         return WrappedMapping(self._str_map, decodewrap)
 
     @property
-    def rtype(self) -> 'ResType':
+    def rtype(self) -> ResType[ResType]:
         """.type"""
         return self._mod.type
 
@@ -293,8 +293,8 @@ class ResTypeManager(DataBased):
 
     def __init__(self, sync_blocks_maxlen=128):
         super().__init__()
-        self._type = type_ = ResType(self, None, '.type')
-        type_.mapping = RTypeMapping(self)
+        self._type = type_ = ResType[ResType](self, None, '.type')
+        self._mapping = type_.mapping = RTypeMapping(self)
         self._lock = RLock()
 
     def load_data(self, conn):
@@ -322,17 +322,16 @@ class ResTypeManager(DataBased):
     def start(self):
         """Account starts."""
         super().start()
-        self._account.load_service(
-            self.name, get_servfunc(concat_varname(self, 'type_sync')))
+        self._account.load_service(self.name + 'typesync',
+                                   get_servfunc(concat_varname(self, 'type')))
         logging.debug("module rtyper started")
 
     def setup_session(self, con):
         """Session starts."""
         super().setup_session(con)
-        con.sync_service(serv := self._account.services[self.name + '.type'])
-        con.syncs[self, 'type'] = Sync(
-            con, serv, self._ser_type, self._deser_type)
+        con.syncs[self, 'type'] = Sync(con, self._ser_type, self._deser_type)
 
+    @staticmethod
     def _ser_type(self, type_: ResType, buf: BufferedIOBase) -> int:
         """Serialize a ResType object into buffer."""
         return write_with_size(type_.to_bytes(), buf)
@@ -350,6 +349,11 @@ class ResTypeManager(DataBased):
         con.send(buf.getvalue())
 
     @property
-    def type(self) -> ResType:
+    def mapping(self) -> RTypeMapping:
+        """.type mapping."""
+        return self._mapping
+
+    @property
+    def type(self) -> ResType[ResType]:
         """.type"""
         return self._type
