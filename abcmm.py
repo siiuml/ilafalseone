@@ -79,11 +79,11 @@ class Cryptic(_Cryptic):
     __slots__ = ()
 
     @abstractmethod
-    def Material[T: Cryptic](self) -> InnerSer[T]:
+    def Material[T: Cryptic](self) -> InnerSer:
         """Inner Material class."""
 
     @property
-    def material(self) -> Material | None:
+    def material(self) -> InnerSer[Self] | None:
         return self.Material(self) if self.is_decrypted else None
 
 
@@ -267,11 +267,15 @@ class Salted[T: Resource](WithMsg[T], Resource, Hashed, _Bound):
         return self._mod
 
 
-type CheckFunc = Callable[[MsgBlock], bool]
+type Checker = Callable[[MsgBlock], bool]
 
 
 def break_here(blk: 'MsgBlock') -> bool:
     """Break after current action."""
+    return True
+
+def continue_here(blk: 'MsgBlock') -> bool:
+    """Do not break after current action."""
     return False
 
 
@@ -655,10 +659,10 @@ class BrokenCheck:
                 end[blk] -= 1
             else:
                 del end[blk]
-            return False
+            return True
         if (cnt := len(blk.next) - 2) >= 0:
             end[blk] = cnt
-        return True
+        return False
 
     @property
     def end(self) -> dict[MsgBlock, int]:
@@ -764,18 +768,9 @@ class Graph(BrokenGraph):
                  start: Iterable[MsgBlock], end: Iterable[MsgBlock]):
         super().__init__(mod, id_, start, end)
 
-    # def __contains__(self, blk: MsgBlock):
-    #     if not isinstance(blk, MsgBlock):
-    #         raise ValueError(blk)
-    #     for start in self._start:
-    #         chain = start.chain
-    #         start_pos = start.position
-    #         end_pos = None
-    #         for end in self._end:
-    #             if end in chain:
-    #                 pos = end.position
-    #                 if end_pos is None or pos < end_pos:
-    #                     end_pos = pos
+    def __contains__(self, blk: MsgBlock):
+        self._mod.sql_conn.execute("SELECT * FROM soblock WHERE chain WHERE ")
+        blk.chain
 
     @property
     def rdig(self) -> bytes:
@@ -793,6 +788,7 @@ class Graph(BrokenGraph):
 
 
 class Chain(Sequence[MsgBlock], _Bound):
+
 
     """Chain."""
 
@@ -986,7 +982,7 @@ class Chain(Sequence[MsgBlock], _Bound):
         return self._mod
 
 
-type ToLoadFinder = Callable[[Chain, int, CheckFunc], tuple[int, int]]
+type ToLoadFinder = Callable[[Chain, int, Checker], tuple[int, int]]
 
 
 @dataclass(slots=True)
@@ -997,7 +993,7 @@ class MonoToLoadFinder:
     maxlen: int
     step: int
 
-    def find_mono(self, chain: Chain, pos: int, check: CheckFunc
+    def find_mono(self, chain: Chain, pos: int, check: Checker
                   ) -> int:
         """Find a position mono-directly."""
         keys = chain.data.keys()
@@ -1015,7 +1011,7 @@ class MonoToLoadFinder:
                 stop = j
         return stop
 
-    def __call__(self, chain: Chain, pos: int, check: CheckFunc
+    def __call__(self, chain: Chain, pos: int, check: Checker
                  ) -> tuple[int, int]:
         stop = self.find_mono(chain, pos, check)
         return (pos, stop) if pos <= stop else (stop, pos)
@@ -1029,7 +1025,7 @@ class BiToLoadFinder:
     backward: int
     forward: int
 
-    def __call__(self, chain: Chain, pos: int, check: CheckFunc
+    def __call__(self, chain: Chain, pos: int, check: Checker
                  ) -> tuple[int, int]:
         return (
             MonoToLoadFinder(self.forward, 1).find_mono(chain, pos, check),
@@ -1045,7 +1041,7 @@ class TotalToLoadFinder:
     maxlen: int
     offset: int | None = None
 
-    def __call__(self, chain: Chain, pos: int, check: CheckFunc
+    def __call__(self, chain: Chain, pos: int, check: Checker
                  ) -> tuple[int, int]:
         maxlen, off = self.maxlen, self.offset
         from_ = MonoToLoadFinder(off, -1).find_mono(chain, pos, check)
@@ -1066,7 +1062,7 @@ class InnerMapping[KT, VT: Serializable, MT: TypedMapping](
 
 class SaltedMapping(TypedMapping, Bound):
 
-    type _InnerMapping[KT] = InnerMapping[KT, Salted, 'SaltedMapping']
+    _M_ARGS = Salted, 'SalteMapping'
 
     def __len__(self) -> int:
         conn = self._mod.sql_conn
@@ -1075,7 +1071,7 @@ class SaltedMapping(TypedMapping, Bound):
         hidden, = next(conn.execute("SELECT COUNT(*) FROM salted_hash"))
         return not_hidden + hidden
 
-    class IDMapping(_InnerMapping[int]):
+    class IDMapping(InnerMapping[int, *_M_ARGS]):
 
         def __getitem__(self, key: int) -> Salted:
             outer = self._outer
@@ -1089,7 +1085,7 @@ class SaltedMapping(TypedMapping, Bound):
         """Mapping using ID as key."""
         return self.IDMapping(self)
 
-    class HashMapping(_InnerMapping[bytes]):
+    class HashMapping(InnerMapping[bytes, *_M_ARGS]):
 
         def __getitem__(self, key: bytes) -> Salted:
             return Salted(self._outer.mod, None, None, key)
@@ -1099,7 +1095,7 @@ class SaltedMapping(TypedMapping, Bound):
         """Mapping using hash as key."""
         return self.HashMapping(self)
 
-    class BytesMapping(_InnerMapping[bytes]):
+    class BytesMapping(InnerMapping[bytes, *_M_ARGS]):
 
         def __getitem__(self, key: bytes) -> Salted:
             mod = self._outer.module
@@ -1134,14 +1130,14 @@ class OwnedMapping(TypedMapping[Owned], Bound):
 
     """Owned resource mapping."""
 
-    type _InnerMapping[KT] = InnerMapping[KT, Owned, 'OwnedMapping']
+    _M_ARGS = Owned, 'OwnedMapping'
 
     def __len__(self) -> int:
         cnt, = next(self._mod.sql_conn.execute(
             "SELECT COUNT(*) FROM soblock WHERE owner IS NOT NULL"))
         return cnt
 
-    class IDMapping(_InnerMapping[int]):
+    class IDMapping(InnerMapping[int, *_M_ARGS]):
 
         def __getitem__(self, key: int) -> Salted:
             outer = self._outer
@@ -1155,7 +1151,7 @@ class OwnedMapping(TypedMapping[Owned], Bound):
         """Mapping using ID as key."""
         return self.IDMapping(self)
 
-    class BytesMapping(_InnerMapping[bytes]):
+    class BytesMapping(InnerMapping[bytes, *_M_ARGS]):
 
         def __getitem__(self, key: bytes) -> Salted:
             mod = self._outer.module
@@ -1203,7 +1199,8 @@ class MsgBlkMapping(TypedMapping[MsgBlock], Bound):
         cnt, = next(self._mod.sql_conn.execute("SELECT COUNT(*) FROM soblock"))
         return cnt
 
-    def __init__(self, loading_maxsize: int):
+    def __init__(self, mod: 'ABCMM', loading_maxsize: int):
+        super().__init__(mod)
         self._id_map = self.IDMapping(self, loading_maxsize)
         self._hash_map = self.HashMapping(self)
 
@@ -1769,7 +1766,6 @@ class ABCMM(DataBased):
 
     def __init__(
         self,
-        database: str,
         blocks_maxlen=1024,
         sync_blocks_maxlen=128,
         chain_compatability=0,

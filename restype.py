@@ -12,7 +12,7 @@ Resource type manager.
 import logging
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from io import BufferedIOBase, BufferedReader, BytesIO
 from threading import RLock
 
@@ -20,7 +20,7 @@ from .basemodule import Bound, DataBased
 from .session import Session
 from .session import Sync, concat_varname, get_servfunc
 from .session import Fillers, Syncable, SyncFiller
-from .utils import FuncWrapper, WrappedMapping
+from .utils import FuncWrapper, Inner, WrappedMapping
 
 from .ilfocore.constants import BYTEORDER
 from .ilfocore.utils import pack_with_size, read_by_size, write_with_size
@@ -162,7 +162,7 @@ class ResType[T: Serializable](Resource, Bound):
 
     def __init__(self, mod: 'ResTypeManager', id_: int, type_str: str):
         self._mod = mod
-        Resource.__init__(self, id_)
+        self._id = id_
         self.__data = type_str
 
     def to_fillers(self, fillers: Fillers):
@@ -236,26 +236,37 @@ class RTypeMapping(TypedMapping[ResType], Bound):
 
     """Type mapping."""
 
-    __slots__ = '_mod', '_id_map', '_str_map'
-
     def __init__(self, mod: 'ResTypeManager'):
         self._mod = mod
         self._id_map = {}
-        self._str_map = defaultdict(self._factory)
+        self._str_map = self.StrMapping(self)
 
-    def _factory(self, type_str: str) -> ResType:
-        mod = self._mod
-        with mod.sql_conn as conn:
-            rowid = conn.execute(
-                "INSERT INTO res_type(type) VALUE(?)", (type_str,)).lastrowid
-            id_, = next(conn.execute(
-                "SELECT id FROM res_type WHERE rowid = ?", (rowid,)))
-        self.add(type_ := ResType(mod, id_, type_str))
-        return type_
+    class StrMapping(dict[str, ResType], Inner['RTypeMapping']):
+
+        def __init__(self, outer: 'RTypeMapping'):
+            super().__init__()
+            Inner.__init__(self, outer)
+
+        def __getitem__(self, type_str: str) -> ResType:
+            if (type_ := self.get(type_str)) is None:
+                outer = self._outer
+                mod = outer.module
+                with mod.sql_conn as conn:
+                    rowid = conn.execute(
+                        "INSERT INTO res_type(type) VALUES(?)",
+                        (type_str,)).lastrowid
+                    id_, = next(conn.execute(
+                        "SELECT id FROM res_type WHERE rowid = ?", (rowid,)))
+                outer.add(type_ := ResType(mod, id_, type_str))
+            return type_
 
     def add(self, type_: ResType):
         self._id_map[type_.rid] = type_
         self._str_map[str(type_)] = type_
+        logging.debug("load type %s", type_)
+
+    def update(self, types: Iterable[ResType]):
+        map(self.add, types)
 
     def read(self, con: Session, buf: BufferedReader) -> ResType:
         """Read resource from received buffer."""
@@ -263,12 +274,12 @@ class RTypeMapping(TypedMapping[ResType], Bound):
 
     @property
     def rid(self) -> dict[int, ResType]:
-        """ID-to-rtype Mapping."""
+        """Mapping using ID as key."""
         return self._id_map
 
     @property
     def str(self) -> defaultdict[str, ResType]:
-        """Type-string-to-rtype Mapping."""
+        """Mapping using type string as key."""
         return self._str_map
 
     @property
@@ -291,10 +302,10 @@ class ResTypeManager(DataBased):
 
     name = '.restype'
 
-    def __init__(self, sync_blocks_maxlen=128):
+    def __init__(self):
         super().__init__()
-        self._type = type_ = ResType[ResType](self, None, '.type')
-        self._mapping = type_.mapping = RTypeMapping(self)
+        self._type: ResType[ResType] = None
+        self._mapping = RTypeMapping(self)
         self._lock = RLock()
 
     def load_data(self, conn):
@@ -304,20 +315,13 @@ class ResTypeManager(DataBased):
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS res_type(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    type INTEGER NOT NULL UNIQUE
+                    type TEXT NOT NULL UNIQUE
                 )""")
-            row = next(conn.execute("SELECT id FROM res_type WHERE type = ",
-                                    ('.type',)), None)
-            type_ = self._type
-            type_._rid, = next(conn.execute(
-                "SELECT id FROM res_type WHERE rowid = ", (
-                    conn.execute("INSERT INTO res_type(type) VALUES(?)",
-                                 ('.type',)).lastrowid,
-                ))) if row is None else row
-            type_.mapping.rid.update(
-                row for row in conn.execute(
-                    "SELECT id, type FROM res_type WHERE type != ?",
-                    ('.type',)))
+            maps = self._mapping
+            maps.update(ResType(self, *row) for row in conn.execute(
+                "SELECT id, type FROM res_type"))
+            logging.debug("loaded types %s", list(maps.str.values()))
+            self._type = maps.str['.type']
 
     def start(self):
         """Account starts."""

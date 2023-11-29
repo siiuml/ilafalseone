@@ -10,7 +10,7 @@ Signing manager.
 """
 
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from io import BufferedIOBase, BufferedReader, BytesIO
 from reprlib import recursive_repr
 from threading import RLock
@@ -75,9 +75,11 @@ class Signer(Resource, Bound):
                         "UPDATE signer SET priv_key = NULL WHERE id = ?",
                         (id_,))
             return
-        if self._priv.public_key != self._pub:
-            raise ValueError(priv)
 
+        if priv.public_key != self._pub:
+            raise ValueError(priv)
+        self._priv = priv
+        self._pub = priv.public_key
         with conn:
             conn.execute(
                 "UPDATE signer SET priv_key = ? WHERE id = ?",
@@ -91,6 +93,10 @@ class Signer(Resource, Bound):
 
     def to_bytes(self) -> bytes:
         return pack_with_size(encode(self._pub.name)) + self._pub.to_bytes()
+
+    @property
+    def rid(self) -> int:
+        return self._id
 
     @property
     def rdig(self) -> bytes:
@@ -113,73 +119,81 @@ class SignerMapping(TypedMapping[Signer], Bound):
 
     """Signer mapping."""
 
-    noalgwrap = FuncWrapper[bytes, [str | None, bytes]](
-        lambda key: (None, key), lambda pair: pair[1], "noalgwrap")
+    class KeyMapping(Mapping[KeyLike, Signer], Inner['SignerMapping']):
 
-    class KeyMapping(Mapping[KeyLike, Signer],
-                     dict[bytes, Signer], Inner['SignerMapping']):
+        def __len__(self) -> int:
+            return len(self._outer.rdig)
 
-        def __init__(self, outer: 'SignerMapping'):
-            super().__init__()
-            Inner.__init__(self, outer)
-
-        def __contains__(self, key) -> bool:
-            if isinstance(key, Iterable):
+        def __contains__(self, key: KeyLike) -> bool:
+            if isinstance(key, bytes):
+                buf = BytesIO(key)
+                _, key = read_by_size(buf, not_none=False), buf.read()
+            else:
                 _, key = key
-            return super().__contains__(key)
+            return self._outer.rdig(key)
 
         def get(self, key: KeyLike, default=None):
-            if isinstance(key, Iterable):
+            if isinstance(key, bytes):
+                buf = BytesIO(key)
+                _, key = read_by_size(buf, not_none=False), buf.read()
+            else:
                 _, key = key
-            return super().get(key, default)
+            return self._outer.rdig.get(key, default)
 
         def __getitem__(self, key: KeyLike):
             pub_key = key if isinstance(key, PublicKey) else None
-            if pub_key is not None or isinstance(key, Iterable):
-                alg, key = key
-            else:
+            if isinstance(key, bytes):
                 buf = BytesIO(key)
                 alg, key = read_by_size(buf, not_none=False), buf.read()
-            if alg is not None:
-                if (signer := super().get(key)) is not None:
-                    return signer
+            else:
+                alg, key = key
+            outer = self._outer
+            pub_bytes_map = outer.rdig
+            if alg is None:
+                return pub_bytes_map[key]
+
+            if (signer := pub_bytes_map.get(key)) is None:
                 if pub_key is None:
                     pub_key = get_verify(alg).from_bytes(key)
-                self[key] = signer = self._outer._add_key(pub_key)
-                return signer
-            else:
-                return super().__getitem__(key)
+                signer = outer._add_key(pub_key)
+            return signer
+
+        def __iter__(self) -> Iterator[PublicKey]:
+            for signer in self._outer.rdig.values():
+                yield signer.public
 
     def __init__(self, mod: 'SigningManager'):
         self._mod = mod
         self._id_map = {}
+        self._pub_bytes_map = {}
 
     def _add_key(self, pub_key: PublicKey) -> Signer:
         mod = self._mod
         with mod.sql_conn as conn:
             rowid = conn.execute(
-                "INSERT INTO signer(alg, pub_key) VALUE(?, ?)",
-                pub_key).lastrowid
+                "INSERT INTO signer(alg, pub_key) VALUES(?, ?)",
+                tuple(pub_key)).lastrowid
             id_, = next(conn.execute(
                 "SELECT id FROM signer WHERE rowid = ?", (rowid,)))
         self._id_map[id_] = signer = Signer(mod, id_, pub_key)
+        self._pub_bytes_map[pub_key.to_bytes()] = signer
         return signer
 
     @property
     def rid(self) -> dict[int, Signer]:
-        """ID-to-signer mapping."""
+        """Mapping using ID as key."""
         return self._id_map
 
     @property
     def key(self) -> KeyMapping:
-        """Key-signer mapping."""
+        """Mapping using KeyLike objects as key."""
         return self.KeyMapping(self)
 
     bytes = key
 
     @property
     def rdig(self) -> Mapping[bytes, ResType, KeyLike, ResType]:
-        return WrappedMapping(self.key, self.noalgwrap)
+        return self._pub_bytes_map
 
     def read(self, con: Session, buf: BufferedReader) -> Signer:
         return con.syncs[self._mod, 'signer'].read(buf)
@@ -197,8 +211,6 @@ class SignerMapping(TypedMapping[Signer], Bound):
 class Signature[T: Resource](WithMsg[T], Resource, Bound):
 
     """Signature class."""
-
-    __slots__ = '_mod', '_id', '_sig', '_signer', '_msg'
 
     def __init__(self, mod: 'SigningManager', id_: int,
                  sig: bytes, signer: Signer, msg: Resource):
@@ -344,6 +356,9 @@ class SignatureMapping(TypedMapping[Signer], Bound):
                     "SELECT id FROM signature WHERE rowid = ?", (rowid,))
             return Signature(mod, id_, sig_bytes, signer, msg)
 
+    def __init__(self, mod: 'SigningManager'):
+        self._mod = mod
+
     def __len__(self) -> int:
         cnt, = self._mod.sql_conn.execute("SELECT COUNT(*) FROM signature")
         return cnt
@@ -428,18 +443,18 @@ class SigningManager(DataBased):
 
     def load_data(self, conn):
         """Load data from database."""
-        super().__init__(conn)
+        super().load_data(conn)
         self._rtyper = rtyper = self._account.modules[ResTypeManager.name]
-        str_types = rtyper.mapping
+        str_types = rtyper.mapping.str
         str_types['.sig'].mapping = self._maps_sig
         str_types['.signer'].mapping = signers = self._maps_signer
         with conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS signer(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    alg TEXT NOT NULL
+                    alg TEXT NOT NULL,
                     pub_key BLOB NOT NULL UNIQUE,
-                    priv_key BLOB,
+                    priv_key BLOB
                 );
                 
                 CREATE TABLE IF NOT EXISTS signature(
@@ -451,7 +466,7 @@ class SigningManager(DataBased):
                 );
                 
                 CREATE INDEX IF NOT EXISTS res_index
-                ON signature(type, res);
+                ON signature(mtype, msg);
                 CREATE INDEX IF NOT EXISTS sig_index
                 ON signature(sig);
             """)
@@ -464,17 +479,20 @@ class SigningManager(DataBased):
                 else:
                     priv_key = get_sign(alg).from_bytes(priv_bytes, pub_bytes)
                     pub_key = priv_key.public_key
-                signers.key[pub_bytes] = Signer(self, id_, pub_key, priv_key)
+                signers.rdig[pub_bytes] = Signer(self, id_, pub_key, priv_key)
 
     def start(self):
         """Account starts."""
-        account = self._account
-        load = account.load_service
+        acct = self._account
+        load = acct.load_service
         name = self.name
         load(name + '.signersync',
              get_servfunc(concat_varname(self, 'signer')))
         load(name + '.sigsync', self._serv_sig)
-        self._maps_signer.key[account.node.sig_key]
+        local_key = acct.node.sig_key
+        local_signer = self._maps_signer.key[local_key.public_key]
+        if local_signer.private is None:
+            local_signer.private = local_key
         logging.debug("module singer started")
 
     def setup_session(self, con):
@@ -506,7 +524,7 @@ class SigningManager(DataBased):
         return (write_with_size(bytes(pub_key.name, ENCODING), buf)
                 + write_with_size(pub_key.to_bytes(), buf))
 
-    def _deser_key(self, buf: BufferedReader) -> Signer:
+    def _deser_signer(self, buf: BufferedReader) -> Signer:
         """Deserialize a public key from buffer."""
         return self._maps_signer.key[
             str(read_by_size(buf), ENCODING), read_by_size(buf)]

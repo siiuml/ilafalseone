@@ -44,13 +44,14 @@ class Account:
     def __init__(
         self,
         alg: str,
-        priv_bytes: bytes,
+        priv_key: bytes | signature.PrivateKey,
         pub_bytes: bytes | None = None
     ):
         self._mods: dict[str, Module] = {}
         self._servs: dict[str, Service] = {}
         self._mods_lock = RLock()
-        priv_key = signature.get_sign(alg).from_bytes(priv_bytes, pub_bytes)
+        if isinstance(priv_key, bytes):
+            priv_key = signature.get_sign(alg).from_bytes(priv_key, pub_bytes)
         self._node = self.NodeClass(priv_key, self)
         self._is_started = False
         self._is_online = False

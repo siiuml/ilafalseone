@@ -31,6 +31,7 @@ from .utils import OrderedList
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
+    from .account import Account
     from .basemodule import Module
 
 
@@ -139,7 +140,8 @@ class Sync[T: Hashable]:
 
     """Synchronized factors in sessions."""
 
-    __slots__ = '_con', '_serv', '_senddict', '_recvlist', '_ser', '_deser'
+    __slots__ = ('_con', '_ser', '_deser',
+                 '_senddict', '_recvlist', '_sync_mark')
 
     def __init__(self, con: 'Session',
                  serialization: Serialization[T] = write_with_size,
@@ -311,7 +313,7 @@ class _VarsDict[T](dict[_VarNameType, T]):
     def get(self, key: _VarNameType, default=None, /) -> T:
         return super().get(self._get_str_key(key), default)
 
-    def __setitem___(self, key: _VarNameType, value: T, /):
+    def __setitem__(self, key: _VarNameType, value: T, /):
         super().__setitem__(self._get_str_key(key), value)
 
     def __delitem__(self, key: _VarNameType, /):
@@ -391,12 +393,6 @@ class Session(BaseSession):
 
     def __init__(self, conn):
         super().__init__(conn)
-        account = self.node.account
-        self.__mods = account.modules.values()
-        self.__mods_lock = account.modules_lock
-        self.__servs = servs = account.services
-        self.__serv = servs['.servsync']
-
         self._serv_sync = sync = Sync(self, self._ser_serv, self._deser_serv)
         self._syncs = syncs = _VarsDict[Sync]()
         syncs[self, 'serv'] = sync
@@ -408,8 +404,9 @@ class Session(BaseSession):
     def setup_common(self):
         """Setup the session."""
         self.handle = self.handle_common
-        with self.__mods_lock:
-            for mod in self.__mods:
+        acct = self.account
+        with acct.modules_lock:
+            for mod in acct.modules.values():
                 mod.setup_session(self)
                 if self.is_finished:
                     break
@@ -434,14 +431,16 @@ class Session(BaseSession):
         """Finish the session."""
         logging.debug("finish session by %s",
                       traceback.extract_stack()[-2][2])
-        with self.__mods_lock:
-            for mod in self.__mods:
+        acct = self.account
+        with acct.modules_lock:
+            for mod in acct.modules.values():
                 mod.finish_session(self)
         super().finish()
 
     def close(self):
-        with self.__mods_lock:
-            for mod in self.__mods:
+        acct = self.account
+        with acct.modules_lock:
+            for mod in acct.modules.values():
                 mod.close_session(self)
 
     def _serv_servsync(self, buf: BufferedReader):
@@ -459,7 +458,7 @@ class Session(BaseSession):
 
     def _deser_serv(self, buf: BufferedIOBase) -> Service:
         """Deserialize a service from buffer."""
-        return self.__servs.get(deser_str(buf), unreadble)
+        return self.account.services.get(deser_str(buf), unreadble)
 
     def sync_service(self, *services: Service):
         """Synchronize services to target."""
@@ -504,3 +503,7 @@ class Session(BaseSession):
     def __dict__(self) -> _VarsDict:
         """Variables binding to the session."""
         return self._dict
+
+    @property
+    def account(self) -> 'Account':
+        return self.node.account
